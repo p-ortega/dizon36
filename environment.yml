@@ -1,0 +1,25 @@
+name: benchmarks_rtm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pandas>=2.0
+  - numpy>=1.25 
+  - matplotlib 
+  - jupyter 
+  - notebook 
+  - rtree
+  - pyproj>=2.0
+  - pyshp
+  - git
+  - scikit-learn
+  - shapely
+  - pip:
+      - -e ./dependencies/mf6rtm
+      - -e ./dependencies/flopy
+      # - -e ./dependencies/pyemu
+      # - -e ./dependencies/pypestutils
+
+
+
