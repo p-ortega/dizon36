@@ -1,4 +1,4 @@
-name: benchmark_rtm
+name: benchmarks_rtm
 channels:
   - conda-forge
 dependencies:
@@ -15,9 +15,9 @@ dependencies:
   - git
   - scikit-learn
   - shapely
-  # - pip:
-      # - git+https://github.com/p-ortega/mf6rtm.git
-      # - -e ./dependencies/flopy
+  - pip:
+      - -e ./dependencies/mf6rtm
+      - -e ./dependencies/flopy
       # - -e ./dependencies/pyemu
       # - -e ./dependencies/pypestutils
 
