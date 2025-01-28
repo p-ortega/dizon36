@@ -91,8 +91,6 @@ perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
              (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
              (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
 
-# specify minimum packages to get a placeholder model set-up to fill in relevant model data
-
 top = -273  # Top elevation (constant, meters above mean sea level)
 #botm = np.linspace(40, -10, nlay)
 botm = np.zeros((nlay, nrow, ncol))  # Bottom elevations of each layer (meters)
@@ -266,19 +264,7 @@ else:
     print(result.stderr)
     
 os.chdir(cwd)
-
-# success, buff = flow_model.run_simulation()
-
-# if success:
-#     print("Simulation ran successfully!")
-# else:
-#     print("Simulation failed. Check the output for errors.")
-
-
     
-# plot heads in mapview for each layer
-h = gwf.output.head().get_alldata()
-
 # Get the time discretization information
 tdis = gwf.simulation.tdis
 perioddata = tdis.perioddata.array
@@ -290,13 +276,16 @@ for perlen in perioddata["perlen"]:
     cumulative_time += perlen
     end_of_stress_period_times.append(cumulative_time)
 
+# plot heads in mapview for each layer
+h = gwf.output.head().get_alldata()
+
 # plot the head results mapview
 mapview_output_dir = os.path.join(model_ws, 'output', 'mapview')
 if not os.path.exists(mapview_output_dir):
     os.makedirs(mapview_output_dir)
 
 mapview_counter = 0
-for t in range(nper):
+for t in range(nper-1, nper):
     h_t = h[t, :, :, :]
     masked_h = np.ma.masked_where((h_t < -500) | (h_t > 500), h_t)
     vmin = masked_h.min()
@@ -356,7 +345,7 @@ for t in range(nper):
     vmax = masked_h.max()
     vmin, vmax = np.nanmin(masked_h), np.nanmax(masked_h)  # Set colorbar limits
     
-    for r in range(nrow):
+    for r in range(nrow-1, nrow):
         fig, ax = plt.subplots(1, 1, figsize=(9, 3), constrained_layout=True)
         # first subplot
         ax.set_title("Row: " + f"{r+1}" + " Stress Period - nper: " + f"{t}" + ' time in days: ' + str(end_of_stress_period_times[t]))
