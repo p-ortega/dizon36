@@ -534,6 +534,61 @@ for i, layer_txt_files in enumerate(layer_txt_files):
                                 os.path.join(transport_ws, 'props', 'icbund', 'format_'+str(layer_txt_files)), 
                                 nrow, 
                                 ncol)
+    
+# define parameters for source-sink-mixing (SSM) package defined from SSM package file
+# specify six booleans in line 1 for types
+FWEL = 'T' # fwel flag is true
+FDRN = 'F' # fdrn flag is false
+FRCH = 'F' # frch flag is false
+FEVT = 'F' # fevt flag is false
+FRIV = 'F' # friv flag is false
+FGHB = 'F' # fghb flag is false
+
+ssm_line_1 = pd.DataFrame([[str(FWEL), str(FDRN), str(FRCH), str(FEVT), str(FRIV), str(FGHB)]])
+ssm_line_1.columns = [0, 1, 2, 3, 4, 5]  # Assuming the first column is the index column
+
+# define ssm line 2
+MXSS = 2245 # maximum number of source-sinks defined from SSM package file
+ssm_line_2 = pd.DataFrame([[MXSS]], columns=[0])
+
+# define all of the source-sink terms for the well boundary conditions with chemistry for all 29 constituents
+# lay, row, col, CSS (0=dummy value per manual), type (2=well), 
+# Orgc, O(0), C(4), C(-4), Ca, 
+# Cl, Fe(2), Fe(3), K, Mg, 
+# N(3), N(5), Na, S(-2), S(6), 
+# Si, Amm, N(0), Tmp, pH, 
+# pe, Ferrihydrite, Orgmatter, Ca_ex, Fe_ex, 
+# K_ex, Mg_ex, Na_ex, Pyrite
+
+# load in csv of ssm entries
+ssm_entry_rows = pd.read_csv(os.path.join(os.getcwd(), 'transport', 'ssm', 'ssm_entries.csv'), index_col=False)
+# Remove column headers from the CSV data
+ssm_entry_rows.columns = range(ssm_entry_rows.shape[1])  # Reset column names to default integer-based names
+
+# combine all entries to make ssm package dataframe
+
+ssm_combined = pd.concat([ssm_line_1, ssm_line_2, ssm_entry_rows], ignore_index=True, axis=0)
+
+# Check the first 5 columns for numeric values and round them to nearest integer for lay row col css type
+# We only modify the first 5 columns (0, 1, 2, 3, 4)
+for col in range(5):  # Loop through the first 5 columns
+    # Convert values to numeric, keeping 'T' and 'F' booleans intact
+    ssm_combined.iloc[1:, col] = pd.to_numeric(ssm_combined.iloc[1:, col], errors='coerce')
+
+    # Round numeric values to nearest whole number (integer), but leave 'T' and 'F' unaffected
+    ssm_combined.iloc[1:, col] = ssm_combined.iloc[1:, col].round()
+
+# print combined ssm 
+print(ssm_combined)
+# Now let's write the DataFrame to a text file while skipping NaN values
+file_path = os.path.join(os.getcwd(), 'transport', 'ssm', 'ssm_pkg_test.txt')  # Specify your file path
+# Convert DataFrame to string (without NaN values)
+ssm_combined_cleaned = ssm_combined.fillna('')  # Replace NaN with empty string if needed
+output_str = ssm_combined_cleaned.to_string(index=False, header=False)
+
+# Write the string to a text file
+with open(file_path, 'w') as file:
+    file.write(output_str)
 
 # import phinp.dat from pht3d model using phreeqc rm
 nxyz = nlay * ncol * nrow
