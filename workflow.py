@@ -8,6 +8,7 @@ import flopy
 import itertools
 from mf6rtm import utils
 from collections import defaultdict
+from flopy.utils.gridintersect import GridIntersect
 
 datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
@@ -58,6 +59,33 @@ def calculate_vertical_conductivity(vcont, thickness, nlay, nrow, ncol):
     
     return k33
 
+def make_obs_pack(gwf):
+    ix = GridIntersect(gwf.modelgrid)
+    obsloc = pd.read_csv(os.path.join("data", "obs_loc.csv"))
+
+    obs_list=[]
+
+    for obsid in obsloc.obsid.unique():
+        x,y = obsloc.loc[obsloc.obsid==obsid,['x','y']].values[0]
+        cellid = ix.intersect([(x,y)],shapetype="point").cellids
+        if len(cellid)==0:
+            print(f"{obsid} not in model domain")
+            continue
+        else:
+            cellid = cellid[0]
+            print(f"{obsid} is in model domain") 
+        obs_layer = int(obsloc.loc[obsloc.obsid==obsid,'layer'].values[0])
+        obs_list.append((obsid, 'concentration', (obs_layer, cellid[0], cellid[1])))
+
+    # obs_recarray = {'obs.head.sim.csv':obs_list}
+    obs_recarray = {f'obs_{gwf.name}.csv':obs_list}
+    print(obs_list)
+    obs_package = flopy.mf6.ModflowUtlobs(gwf, 
+                                        digits=0, #print_input=True,
+                                        pname=f'obs_{gwf.name}',
+                                        continuous=obs_recarray)
+    return obs_package
+
 def make_dis(gwf):
     # Define model parameters for the dummy model
     nlay = 12  # Number of layers
@@ -84,6 +112,8 @@ def make_dis(gwf):
         top=top,
         idomain=ib,
         botm=botm,
+        xorigin=-148,
+        yorigin=0
     )
     top_elev = reformat_arrays(os.path.join(dis_ws, 'tops', 'top_elev.txt'), 
                         nrow, 
@@ -235,10 +265,7 @@ def make_gwf(model_name = "gwf"):
     ]
 
     init_rates_out  = [-300,  -30,  -30]                # 3 negatives
-    init_rates_in   = [117.5,  40,  70,  95,  37.5]     # 5 positives
-
     fini_rates_out  = [-400,  -40,  -40]
-    fini_rates_in   = [156.7,  53.3,  93.3, 126.6,  50]
 
     init_sp = range(0, 36)   # stress periods 0 – 35
     fini_sp = range(36, 39)  # stress periods 36 – 38
@@ -261,15 +288,8 @@ def make_gwf(model_name = "gwf"):
         ]
 
     # Time‑invariant blocks for each phase
-    # wellin_init   = make_rows(coords_in,  init_rates_in)
     wellout_init  = make_rows(coords_out, init_rates_out)
-    # wellin_fini   = make_rows(coords_in,  fini_rates_in,  add_conc=True)
     wellout_fini  = make_rows(coords_out, fini_rates_out, add_conc=True)
-
-    # 3) Assemble stress‑period dictionaries
-    # wellin_sp_data  = {sp: (wellin_init  if sp in init_sp else wellin_fini)
-    #                 for sp in all_sp}
-
     wellout_sp_data = {sp: (wellout_init if sp in init_sp else wellout_fini)
                     for sp in all_sp}
     
@@ -285,45 +305,6 @@ def make_gwf(model_name = "gwf"):
                                        pname = 'welout' ,
                                        filename=f'{model_name}.welout')
     wel_out.set_all_data_external()
-    # Define wel package injection & extraction wells & schedules
-    # flopy_offset = 1
-    # pumping_data_init = [[(2-flopy_offset, 10-flopy_offset, 10-flopy_offset), -300 , 0],
-    #                     [(2-flopy_offset, 10-flopy_offset, 39-flopy_offset), 117.5, 0],
-    #                     [3-flopy_offset, 10-flopy_offset, 39-flopy_offset, 40, 0],
-    #                     [4-flopy_offset, 10-flopy_offset, 10-flopy_offset, -30, 0],
-    #                     [4-flopy_offset, 10-flopy_offset, 39-flopy_offset, 70],
-    #                     [6-flopy_offset, 10-flopy_offset, 10-flopy_offset, -30],
-    #                     [6-flopy_offset, 10-flopy_offset, 39-flopy_offset, 95],
-    #                     [8-flopy_offset, 10-flopy_offset, 39-flopy_offset, 37.5]]
-
-    # pumping_data_fini = [[2-flopy_offset, 10-flopy_offset, 10-flopy_offset, -400],
-    #                     [2-flopy_offset, 10-flopy_offset, 39-flopy_offset, 156.7],
-    #                     [3-flopy_offset, 10-flopy_offset, 39-flopy_offset, 53.3],
-    #                     [4-flopy_offset, 10-flopy_offset, 10-flopy_offset, -40],
-    #                     [4-flopy_offset, 10-flopy_offset, 39-flopy_offset, 93.3],
-    #                     [6-flopy_offset, 10-flopy_offset, 10-flopy_offset, -40],
-    #                     [6-flopy_offset, 10-flopy_offset, 39-flopy_offset, 126.6],
-    #                     [8-flopy_offset, 10-flopy_offset, 39-flopy_offset, 50]]
-
-    # stress_period_data = {0: pumping_data_init, 1: pumping_data_init, 2: pumping_data_init,
-    #                     3: pumping_data_init, 4: pumping_data_init, 5: pumping_data_init,
-    #                     6: pumping_data_init, 7: pumping_data_init, 8: pumping_data_init,
-    #                     9: pumping_data_init, 10: pumping_data_init, 11: pumping_data_init,
-    #                     12: pumping_data_init, 13: pumping_data_init, 14: pumping_data_init,
-    #                     15: pumping_data_init, 16: pumping_data_init, 17: pumping_data_init,
-    #                     18: pumping_data_init, 19: pumping_data_init, 20: pumping_data_init,
-    #                     21: pumping_data_init, 22: pumping_data_init, 23: pumping_data_init,
-    #                     24: pumping_data_init, 25: pumping_data_init, 26: pumping_data_init,
-    #                     27: pumping_data_init, 28: pumping_data_init, 29: pumping_data_init,
-    #                     30: pumping_data_init, 31: pumping_data_init, 32: pumping_data_init,
-    #                     33: pumping_data_init,  34: pumping_data_init, 35: pumping_data_init,
-    #                     36: pumping_data_fini, 37: pumping_data_fini, 38: pumping_data_fini}
-
-    # wel = flopy.mf6.ModflowGwfwel(gwf,
-    #                               stress_period_data=stress_period_data, 
-    #                               auxiliary='gwt',
-    #                               filename=f'{model_name}.wel')
-    # wel.set_all_data_external()
 
     # create the output control
     headfile = f"{model_name}.hds"
@@ -413,6 +394,8 @@ def make_gwt(sim, model_name = 'gwt'):
             botm=gwf.dis.botm.get_data(),
             idomain=gwf.dis.idomain.get_data(),
             filename=f"{model_name}.dis",
+            xorigin=gwf.dis.xorigin.get_data(),
+            yorigin=gwf.dis.yorigin.get_data()
         )
     dis.set_all_data_external()
 
@@ -489,7 +472,7 @@ def make_gwt(sim, model_name = 'gwt'):
         exgmnameb=f'{model_name}',
         filename=f"{model_name}.gwfgwt",
     )
-    
+    make_obs_pack(gwt)
     sim.write_simulation() 
     return sim
 # lin_sorp_distr_coeff = {
