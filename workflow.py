@@ -5,7 +5,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import flopy
+import itertools
 from mf6rtm import utils
+from collections import defaultdict
 
 datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
@@ -15,7 +17,7 @@ def run_model(sim):
     import pyemu
     pyemu.os_utils.run('mf6', cwd=sim.sim_path)
 
-def reformat_arrays(input_file, output_file, rows, cols):
+def reformat_arrays(input_file, rows, cols, save_file=False):
     # Read the content of the file
     with open(input_file, 'r') as f:
         content = f.read()
@@ -34,7 +36,11 @@ def reformat_arrays(input_file, output_file, rows, cols):
     reshaped_array = values_array.reshape((rows, cols))
 
     # Save the reshaped array to a new file with _format extension
-    np.savetxt(output_file, reshaped_array, fmt='%s')
+    if save_file:
+        root, ext = os.path.splitext(input_file)
+        output_file = f"{root}_formatted{ext}"
+        print(f"Saving reformated file to {output_file}")
+        np.savetxt(output_file, reshaped_array, fmt='%s')
     
     # return reshaped array
     return reshaped_array
@@ -57,7 +63,7 @@ def make_dis(gwf):
     nlay = 12  # Number of layers
     nrow = 10  # Number of rows
     ncol = 51  # Number of columns
-    nper = 39  # Number of stress periods
+    ib = np.ones((nlay, nrow, ncol))
     delc = [4, 40, 24, 16, 12,
             10, 6, 4, 4, 4]  # Column spacing (meters)
     delr = [4, 16, 8, 4, 4, 4, 4, 3, 2, 2, 
@@ -76,11 +82,26 @@ def make_dis(gwf):
         delr=delr,
         delc=delc,
         top=top,
+        idomain=ib,
         botm=botm,
     )
+    top_elev = reformat_arrays(os.path.join(dis_ws, 'tops', 'top_elev.txt'), 
+                        nrow, 
+                        ncol)
+    
+    layer_txt_files = [f"layer_{i}.txt" for i in range(1, 13)]
+
+    botm96 = [
+        reformat_arrays(os.path.join(dis_ws, 'bottoms', filename), nrow, ncol)
+        for filename in layer_txt_files
+    ]
+
+    dis.top = top_elev # meters above mean sea level
+    dis.botm = botm96 # meters above mean sea level
+    dis.set_all_data_external()
     return dis
 
-def make_gwf(model_name = "dizon36"):
+def make_gwf(model_name = "gwf"):
     model_ws = os.path.join("model")
     if os.path.exists(model_ws):
         shutil.rmtree(model_ws)
@@ -110,10 +131,13 @@ def make_gwf(model_name = "dizon36"):
     tdis = flopy.mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", 
                                  nper=nper, perioddata=perioddata)
 
-    # specify ims pkg 
-    ims = flopy.mf6.ModflowIms(sim, pname="ims", 
-                               complexity="COMPLEX")
-
+    ims = flopy.mf6.ModflowIms(sim, 
+                            #    pname="ims", 
+                            complexity="COMPLEX",
+                            filename=f"{model_name}.ims")
+    sim.register_ims_package(ims, 
+                             [model_name])
+    
     # start model build to refine 
     model_nam_file = "{}.nam".format(model_name)
     gwf = flopy.mf6.ModflowGwf(sim, modelname=model_name, 
@@ -121,13 +145,14 @@ def make_gwf(model_name = "dizon36"):
 
     # make dis
     dis = make_dis(gwf)
+
     nlay = dis.nlay.get_data()
     nrow = dis.nrow.get_data()
     ncol = dis.ncol.get_data()
 
     # get properties
     botm96 = np.zeros((nlay, nrow, ncol))
-    ibnd96 = np.ones((nlay, nrow, ncol))
+    
     thick96 = np.zeros((nlay, nrow, ncol))
     scoeff96 = np.zeros((nlay, nrow, ncol))
     trans96 = np.zeros((nlay, nrow, ncol))
@@ -136,45 +161,25 @@ def make_gwf(model_name = "dizon36"):
     vcont96 = np.zeros((nlay, nrow, ncol))
 
     # now let's start filling data from the mf96 arrays to populate the mf6 model
-    layer_txt_files = ['layer_1.txt', 'layer_2.txt', 'layer_3.txt', 'layer_4.txt', 
-                    'layer_5.txt', 'layer_6.txt', 'layer_7.txt', 'layer_8.txt', 
-                    'layer_9.txt', 'layer_10.txt', 'layer_11.txt', 'layer_12.txt']
+    layer_txt_files = [f"layer_{i}.txt" for i in range(1, 13)]
+
     
     for i, layer_txt_files in enumerate(layer_txt_files):
-        botm96[i] = reformat_arrays(os.path.join(dis_ws, 'bottoms', layer_txt_files), 
-                                    os.path.join(dis_ws, 'bottoms', 'format_'+str(layer_txt_files)), 
-                                    nrow, 
-                                    ncol)
-        # ibnd96[i] = reformat_arrays(os.path.join(dis_ws, 'ibound', layer_txt_files), 
-        #                             os.path.join(dis_ws, 'ibound', 'format_'+str(layer_txt_files)), 
-        #                             nrow, 
-        #                             ncol)
+
         thick96[i] = reformat_arrays(os.path.join(dis_ws, 'thicknesses', layer_txt_files), 
-                                    os.path.join(dis_ws, 'thicknesses', 'format_'+str(layer_txt_files)), 
                                     nrow, 
                                     ncol)
         scoeff96[i] = reformat_arrays(os.path.join(props_ws, 's', layer_txt_files), 
-                                    os.path.join(props_ws, 's', 'format_'+str(layer_txt_files)), 
                                     nrow, 
                                     ncol)
         trans96[i] = reformat_arrays(os.path.join(props_ws, 'T', layer_txt_files), 
-                                    os.path.join(props_ws, 'T', 'format_'+str(layer_txt_files)), 
                                     nrow, 
                                     ncol)
         vcont96[i] = reformat_arrays(os.path.join(props_ws, 'vcont', layer_txt_files), 
-                                    os.path.join(props_ws, 'vcont', 'format_'+str(layer_txt_files)), 
                                     nrow, 
                                     ncol)
 
     # first load in mf96 top elev array reformt and assign to mf6 dis
-    top_elev = reformat_arrays(os.path.join(dis_ws, 'tops', 'top_elev.txt'), 
-                            os.path.join(dis_ws, 'tops', 'format_top_elev.txt'), 
-                            nrow, 
-                            ncol)
-    dis.top = top_elev # meters above mean sea level
-    dis.botm = botm96 # meters above mean sea level
-    dis.idomain = ibnd96
-    dis.set_all_data_external()
 
     ihead = 0 #(meters)
     start = ihead * np.ones((nlay, nrow, ncol))
@@ -215,42 +220,110 @@ def make_gwf(model_name = "dizon36"):
     )
     chd.set_all_data_external()
 
+    coords_out = [ # (row, col, layer) 
+        (1, 9,  9),
+        (3, 9,  9),
+        (5, 9,  9),
+    ]
+
+    coords_in = [
+        (1, 9, 38),
+        (2, 9, 38),
+        (3, 9, 38),
+        (5, 9, 38),
+        (7, 9, 38),
+    ]
+
+    init_rates_out  = [-300,  -30,  -30]                # 3 negatives
+    init_rates_in   = [117.5,  40,  70,  95,  37.5]     # 5 positives
+
+    fini_rates_out  = [-400,  -40,  -40]
+    fini_rates_in   = [156.7,  53.3,  93.3, 126.6,  50]
+
+    init_sp = range(0, 36)   # stress periods 0 – 35
+    fini_sp = range(36, 39)  # stress periods 36 – 38
+    all_sp  = (*init_sp, *fini_sp)
+
+    df_inj = pd.read_csv(os.path.join(datadir, "wellin.csv"))
+    
+    wellin_sp_data = defaultdict(list)
+
+    for _, r in df_inj.iterrows():
+        cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
+        wellin_sp_data[int(r["kper"])].append([cell, r["rate"], r["Cl"]])
+
+    def make_rows(coords, rates, add_conc=True):
+        if len(coords) != len(rates):
+            raise ValueError("Coordinate and rate lists must be the same length")
+        return [
+            ([cell, q, 0.0] if add_conc else [cell, q])
+            for cell, q in zip(coords, rates)
+        ]
+
+    # Time‑invariant blocks for each phase
+    # wellin_init   = make_rows(coords_in,  init_rates_in)
+    wellout_init  = make_rows(coords_out, init_rates_out)
+    # wellin_fini   = make_rows(coords_in,  fini_rates_in,  add_conc=True)
+    wellout_fini  = make_rows(coords_out, fini_rates_out, add_conc=True)
+
+    # 3) Assemble stress‑period dictionaries
+    # wellin_sp_data  = {sp: (wellin_init  if sp in init_sp else wellin_fini)
+    #                 for sp in all_sp}
+
+    wellout_sp_data = {sp: (wellout_init if sp in init_sp else wellout_fini)
+                    for sp in all_sp}
+    
+    wel_in  = flopy.mf6.ModflowGwfwel(gwf, 
+                                       stress_period_data=wellin_sp_data,
+                                       auxiliary='Cl',
+                                       pname = 'welin',
+                                       filename=f'{model_name}.welin')
+    wel_in.set_all_data_external()
+    wel_out = flopy.mf6.ModflowGwfwel(gwf, 
+                                       stress_period_data=wellout_sp_data, 
+                                       auxiliary='Cl',
+                                       pname = 'welout' ,
+                                       filename=f'{model_name}.welout')
+    wel_out.set_all_data_external()
     # Define wel package injection & extraction wells & schedules
-    flopy_offset = 1
-    pumping_data_init = [[2-flopy_offset, 10-flopy_offset, 10-flopy_offset, -300],
-                        [2-flopy_offset, 10-flopy_offset, 39-flopy_offset, 117.5],
-                        [3-flopy_offset, 10-flopy_offset, 39-flopy_offset, 40],
-                        [4-flopy_offset, 10-flopy_offset, 10-flopy_offset, -30],
-                        [4-flopy_offset, 10-flopy_offset, 39-flopy_offset, 70],
-                        [6-flopy_offset, 10-flopy_offset, 10-flopy_offset, -30],
-                        [6-flopy_offset, 10-flopy_offset, 39-flopy_offset, 95],
-                        [8-flopy_offset, 10-flopy_offset, 39-flopy_offset, 37.5]]
+    # flopy_offset = 1
+    # pumping_data_init = [[(2-flopy_offset, 10-flopy_offset, 10-flopy_offset), -300 , 0],
+    #                     [(2-flopy_offset, 10-flopy_offset, 39-flopy_offset), 117.5, 0],
+    #                     [3-flopy_offset, 10-flopy_offset, 39-flopy_offset, 40, 0],
+    #                     [4-flopy_offset, 10-flopy_offset, 10-flopy_offset, -30, 0],
+    #                     [4-flopy_offset, 10-flopy_offset, 39-flopy_offset, 70],
+    #                     [6-flopy_offset, 10-flopy_offset, 10-flopy_offset, -30],
+    #                     [6-flopy_offset, 10-flopy_offset, 39-flopy_offset, 95],
+    #                     [8-flopy_offset, 10-flopy_offset, 39-flopy_offset, 37.5]]
 
-    pumping_data_fini = [[2-flopy_offset, 10-flopy_offset, 10-flopy_offset, -400],
-                        [2-flopy_offset, 10-flopy_offset, 39-flopy_offset, 156.7],
-                        [3-flopy_offset, 10-flopy_offset, 39-flopy_offset, 53.3],
-                        [4-flopy_offset, 10-flopy_offset, 10-flopy_offset, -40],
-                        [4-flopy_offset, 10-flopy_offset, 39-flopy_offset, 93.3],
-                        [6-flopy_offset, 10-flopy_offset, 10-flopy_offset, -40],
-                        [6-flopy_offset, 10-flopy_offset, 39-flopy_offset, 126.6],
-                        [8-flopy_offset, 10-flopy_offset, 39-flopy_offset, 50]]
+    # pumping_data_fini = [[2-flopy_offset, 10-flopy_offset, 10-flopy_offset, -400],
+    #                     [2-flopy_offset, 10-flopy_offset, 39-flopy_offset, 156.7],
+    #                     [3-flopy_offset, 10-flopy_offset, 39-flopy_offset, 53.3],
+    #                     [4-flopy_offset, 10-flopy_offset, 10-flopy_offset, -40],
+    #                     [4-flopy_offset, 10-flopy_offset, 39-flopy_offset, 93.3],
+    #                     [6-flopy_offset, 10-flopy_offset, 10-flopy_offset, -40],
+    #                     [6-flopy_offset, 10-flopy_offset, 39-flopy_offset, 126.6],
+    #                     [8-flopy_offset, 10-flopy_offset, 39-flopy_offset, 50]]
 
-    stress_period_data = {0: pumping_data_init, 1: pumping_data_init, 2: pumping_data_init,
-                        3: pumping_data_init, 4: pumping_data_init, 5: pumping_data_init,
-                        6: pumping_data_init, 7: pumping_data_init, 8: pumping_data_init,
-                        9: pumping_data_init, 10: pumping_data_init, 11: pumping_data_init,
-                        12: pumping_data_init, 13: pumping_data_init, 14: pumping_data_init,
-                        15: pumping_data_init, 16: pumping_data_init, 17: pumping_data_init,
-                        18: pumping_data_init, 19: pumping_data_init, 20: pumping_data_init,
-                        21: pumping_data_init, 22: pumping_data_init, 23: pumping_data_init,
-                        24: pumping_data_init, 25: pumping_data_init, 26: pumping_data_init,
-                        27: pumping_data_init, 28: pumping_data_init, 29: pumping_data_init,
-                        30: pumping_data_init, 31: pumping_data_init, 32: pumping_data_init,
-                        33: pumping_data_init,  34: pumping_data_init, 35: pumping_data_init,
-                        36: pumping_data_fini, 37: pumping_data_fini, 38: pumping_data_fini}
+    # stress_period_data = {0: pumping_data_init, 1: pumping_data_init, 2: pumping_data_init,
+    #                     3: pumping_data_init, 4: pumping_data_init, 5: pumping_data_init,
+    #                     6: pumping_data_init, 7: pumping_data_init, 8: pumping_data_init,
+    #                     9: pumping_data_init, 10: pumping_data_init, 11: pumping_data_init,
+    #                     12: pumping_data_init, 13: pumping_data_init, 14: pumping_data_init,
+    #                     15: pumping_data_init, 16: pumping_data_init, 17: pumping_data_init,
+    #                     18: pumping_data_init, 19: pumping_data_init, 20: pumping_data_init,
+    #                     21: pumping_data_init, 22: pumping_data_init, 23: pumping_data_init,
+    #                     24: pumping_data_init, 25: pumping_data_init, 26: pumping_data_init,
+    #                     27: pumping_data_init, 28: pumping_data_init, 29: pumping_data_init,
+    #                     30: pumping_data_init, 31: pumping_data_init, 32: pumping_data_init,
+    #                     33: pumping_data_init,  34: pumping_data_init, 35: pumping_data_init,
+    #                     36: pumping_data_fini, 37: pumping_data_fini, 38: pumping_data_fini}
 
-    wel = flopy.mf6.ModflowGwfwel(gwf,stress_period_data=stress_period_data, filename=f'{model_name}.wel')
-    wel.set_all_data_external()
+    # wel = flopy.mf6.ModflowGwfwel(gwf,
+    #                               stress_period_data=stress_period_data, 
+    #                               auxiliary='gwt',
+    #                               filename=f'{model_name}.wel')
+    # wel.set_all_data_external()
 
     # create the output control
     headfile = f"{model_name}.hds"
@@ -266,14 +339,15 @@ def make_gwf(model_name = "dizon36"):
         head_filerecord=head_filerecord,
         budget_filerecord=budget_filerecord,
         printrecord=printrecord,)
-    sim.write_simulation()
+    # sim.write_simulation()
     return sim
 
 
 ######## transport ###############
 
-def make_gwt(gwf):
+def make_gwt(sim, model_name = 'gwt'):
 
+    gwf = sim.get_model("gwf")
     nlay = gwf.dis.nlay.get_data()
 
     ne = 0.35 # effective porosity (-) constant across all layers
@@ -291,20 +365,133 @@ def make_gwt(gwf):
     diffc = 0              # diffusion coefficient
     pbulk = 1850           # bulk density (m/L^3)
 
-    transport_parameters = {
-        'ne':           [ne] * nlay,
-        'long_disp':    [long_disp] * nlay,
-        'disp_tr_vert': [disp_tr_vert] * nlay,
-        'disp_tr_hor':  [disp_tr_hor] * nlay,
-        'diffc':        [diffc] * nlay,
-        'pbulk':        [pbulk] * nlay,
-    }
+    # transport_parameters = {
+    #     'ne':           [ne] * nlay,
+    #     'long_disp':    [long_disp] * nlay,
+    #     'disp_tr_vert': [disp_tr_vert] * nlay,
+    #     'disp_tr_hor':  [disp_tr_hor] * nlay,
+    #     'diffc':        [diffc] * nlay,
+    #     'pbulk':        [pbulk] * nlay,
+    # }
 
-    print(transport_parameters)
+    # print(transport_parameters)
 
+    gwt = flopy.mf6.MFModel(
+        sim,
+        model_type="gwt6",
+        modelname=model_name,
+        model_nam_file=f"{model_name}.nam"
+    )
 
+    imsgwt = flopy.mf6.ModflowIms(sim, 
+                                #   pname="ims", 
+                            complexity="COMPLEX",
+                            filename=f"{model_name}.ims")
+    sim.register_ims_package(imsgwt, 
+                             [model_name])
+    
+    # nper = sim.tdis.nper.get_data()
+    # perioddata = sim.tdis.perioddata.get_data()
+    # start_date_time = sim.tdis.start_date_time.get_data()
 
+    # tdis = flopy.mf6.ModflowTdis(sim, pname="tdis",
+    #                                 nper=nper, 
+    #                                 perioddata=perioddata, #gwt_perioddata,
+    #                                 time_units='days', 
+    #                                 start_date_time=start_date_time)
 
+    dis = gwf.dis
+
+    dis = flopy.mf6.ModflowGwtdis(
+            gwt,
+            nlay=gwf.dis.nlay.get_data(),
+            nrow=gwf.dis.nrow.get_data(),
+            ncol=gwf.dis.ncol.get_data(),
+            delr=gwf.dis.delr.get_data(),
+            delc=gwf.dis.delc.get_data(),
+            top=gwf.dis.top.get_data(),
+            botm=gwf.dis.botm.get_data(),
+            idomain=gwf.dis.idomain.get_data(),
+            filename=f"{model_name}.dis",
+        )
+    dis.set_all_data_external()
+
+    nlay = dis.nlay.get_data()
+    nrow = dis.nrow.get_data()
+    ncol = dis.ncol.get_data()
+
+    strt = np.ones(shape=(nlay,ncol, nrow))*0.000254
+    ic = flopy.mf6.ModflowGwtic(gwt, strt=strt, 
+                                filename=f"{model_name}.ic")
+    ic.set_all_data_external()
+
+    adv = flopy.mf6.ModflowGwtadv(
+        gwt,
+        scheme="tvd",
+    )
+    adv.set_all_data_external()
+
+    alpha_l = np.ones(shape=(nlay,ncol, nrow))*long_disp  # Longitudinal dispersivity ($m$)
+    alpha_th = np.ones(shape=(nlay,ncol, nrow))*disp_tr_hor  # Transverse horizontal dispersivity ($m$)
+    alpha_tv = np.ones(shape=(nlay,ncol, nrow))*disp_tr_vert  # Transverse vertical dispersivity ($m$)
+
+    dsp = flopy.mf6.ModflowGwtdsp(
+        gwt,
+        xt3d_off=True,
+        alh=alpha_l,
+        ath1=alpha_th,
+        atv = alpha_tv,
+        diffc = diffc,
+        filename=f"{model_name}.dsp",
+    )
+    dsp.set_all_data_external()
+
+    sourcerecarray = [["welin", "aux", f"Cl"],
+                      ["welout", "aux", f"Cl"]]
+
+    ssm = flopy.mf6.ModflowGwtssm(
+            gwt,
+            sources=sourcerecarray,
+            save_flows=True,
+            print_flows=True,
+            filename=f"{model_name}.ssm",
+        )
+    ssm.set_all_data_external()
+
+    mst = flopy.mf6.ModflowGwtmst(
+        gwt,
+        porosity=ne,
+        first_order_decay=None,
+        decay = None,
+        decay_sorbed=None,
+        sorption= None,
+        bulk_density=pbulk, 
+        distcoef=None, #Kd m3/mg
+        sp2 = None,
+        filename=f"{model_name}.mst",
+    )
+    mst.set_all_data_external()
+    oc = flopy.mf6.ModflowGwtoc(
+        gwt,
+        budget_filerecord=f"{model_name}.cbb",
+        concentration_filerecord=f"{model_name}.ucn",
+        concentrationprintrecord=[("COLUMNS", 10, "WIDTH", 15, "DIGITS", 10, "GENERAL")
+                                    ],
+        saverecord=[("CONCENTRATION", "ALL"), 
+                    ],
+        printrecord=[("CONCENTRATION", "LAST"), 
+                        ],
+    )
+    flopy.mf6.ModflowGwfgwt(
+        sim,
+        exgtype="GWF6-GWT6",
+        exgmnamea='gwf',
+        exgmnameb=f'{model_name}',
+        filename=f"{model_name}.gwfgwt",
+    )
+    
+    sim.write_simulation() 
+    return sim
 # lin_sorp_distr_coeff = {
 
 #     'Orgc':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
@@ -519,8 +706,7 @@ def make_gwt(gwf):
 
 def main():
     sim = make_gwf()
-    gwf = sim.get_model('dizon36')
-    make_gwt(gwf)
-    # run_model(sim)
+    sim = make_gwt(sim, model_name='Cl')
+    run_model(sim)
 if __name__ == "__main__":
     main()
