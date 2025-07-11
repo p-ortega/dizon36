@@ -11,24 +11,48 @@ datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
 props_ws = os.path.join(datadir, 'props')
 
-model_ws = os.path.join('model')
-if not os.path.exists(model_ws):
-    os.makedirs(model_ws)
+def run_model(sim):
+    import pyemu
+    pyemu.os_utils.run('mf6', cwd=sim.sim_path)
 
-# get bins
+def reformat_arrays(input_file, output_file, rows, cols):
+    # Read the content of the file
+    with open(input_file, 'r') as f:
+        content = f.read()
 
-def build_gwf(model_name = "dizon36"):
-    model_ws = os.path.join("model")
-    if os.path.exists(model_ws):
-        shutil.rmtree(model_ws)
+    # Flatten the values into a 1D array and remove spaces or NaNs
+    values = [val for val in content.split() if val.strip() and val.lower() != 'nan']
 
-    # Re‑create an empty folder
-    os.makedirs(model_ws, exist_ok=True)
-    utils.prep_bins(model_ws)
+    # Convert values to a numpy array
+    values_array = np.array(values)
 
-    # create flow model
+    # Ensure the array can be reshaped to the desired shape
+    if len(values_array) != rows * cols:
+        raise ValueError("The number of values does not match the specified shape")
+
+    # Reshape the array into the specified shape
+    reshaped_array = values_array.reshape((rows, cols))
+
+    # Save the reshaped array to a new file with _format extension
+    np.savetxt(output_file, reshaped_array, fmt='%s')
     
+    # return reshaped array
+    return reshaped_array
 
+def calculate_vertical_conductivity(vcont, thickness, nlay, nrow, ncol):
+    nlay, nrow, ncol = vcont.shape
+    k33 = np.zeros((nlay, nrow, ncol))
+
+    for i in range(nlay - 1):
+        for j in range(nrow):
+            for k in range(ncol):
+                k33[i, j, k] = vcont[i, j, k] * ((thickness[i, j, k] / 2) + (thickness[i + 1, j, k] / 2))
+    # Set the vertical hydraulic conductivity of layer 12 equal to layer 11
+    k33[-1] = k33[-2]
+    
+    return k33
+
+def make_dis(gwf):
     # Define model parameters for the dummy model
     nlay = 12  # Number of layers
     nrow = 10  # Number of rows
@@ -42,35 +66,8 @@ def build_gwf(model_name = "dizon36"):
             3, 3, 3, 2, 2, 2, 2, 2, 2, 2,
             3, 4, 4, 4, 4, 4, 4, 12, 24, 40, 
             4]  # Column Spacing (meters)
-
-    perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
-                (7, 7, 1), (7, 7, 1), (7, 7, 1), (14, 14, 1), (14, 14, 1), 
-                (15, 15, 1), (13, 13, 1), (14, 14, 1), (14, 14, 1), (14, 14, 1), 
-                (21, 21, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
-                (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
-                (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
-                (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
-                (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
     top = -273  # Top elevation (constant, meters above mean sea level)
-    #botm = np.linspace(40, -10, nlay)
     botm = np.zeros((nlay, nrow, ncol))  # Bottom elevations of each layer (meters)
-    steady = [False] * nper  # All stress periods are transient
-
-    # specify the mf6 gw object & add relevant components
-    sim = flopy.mf6.MFSimulation(sim_name=model_name, version='mf6', sim_ws='.')
-    sim.set_sim_path(model_ws)
-
-    # specify tdis
-    tdis = flopy.mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", nper=nper, perioddata=perioddata)
-
-    # specify ims pkg 
-    ims = flopy.mf6.ModflowIms(sim, pname="ims", complexity="SIMPLE")
-
-    # start model build to refine 
-    model_nam_file = "{}.nam".format(model_name)
-    gwf = flopy.mf6.ModflowGwf(sim, modelname=model_name, model_nam_file=model_nam_file, exe_name='mf6')
-
-    # specify dis pkg
     dis = flopy.mf6.ModflowGwfdis(
         gwf,
         nlay=nlay,
@@ -81,24 +78,54 @@ def build_gwf(model_name = "dizon36"):
         top=top,
         botm=botm,
     )
-    ihead = 0 #(meters)
-    start = ihead * np.ones((nlay, nrow, ncol))
-    ic = flopy.mf6.ModflowGwfic(gwf, pname="ic", strt=start)
-    # now let's start filling data from the mf96 arrays to populate the mf6 model
-    layer_txt_files = ['layer_1.txt', 'layer_2.txt', 'layer_3.txt', 'layer_4.txt', 
-                    'layer_5.txt', 'layer_6.txt', 'layer_7.txt', 'layer_8.txt', 
-                    'layer_9.txt', 'layer_10.txt', 'layer_11.txt', 'layer_12.txt']
+    return dis
 
-    # first load in mf96 top elev array reformt and assign to mf6 dis
-    top_elev = reformat_arrays(os.path.join(dis_ws, 'tops', 'top_elev.txt'), 
-                            os.path.join(dis_ws, 'tops', 'format_top_elev.txt'), 
-                            nrow, 
-                            ncol)
-    dis.top = top_elev # meters above mean sea level
-    dis.set_all_data_external()
+def make_gwf(model_name = "dizon36"):
+    model_ws = os.path.join("model")
+    if os.path.exists(model_ws):
+        shutil.rmtree(model_ws)
 
-    # now let's load in the mf96 bottom elevations
+    # Re‑create an empty folder
+    os.makedirs(model_ws, exist_ok=True)
+    utils.prep_bins(model_ws)
 
+    nper = 39  # Number of stress periods
+
+    perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
+                (7, 7, 1), (7, 7, 1), (7, 7, 1), (14, 14, 1), (14, 14, 1), 
+                (15, 15, 1), (13, 13, 1), (14, 14, 1), (14, 14, 1), (14, 14, 1), 
+                (21, 21, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
+
+    steady = [False] * nper  # All stress periods are transient
+
+    # specify the mf6 gw object & add relevant components
+    sim = flopy.mf6.MFSimulation(sim_name=model_name, version='mf6', sim_ws='.')
+    sim.set_sim_path(model_ws)
+
+    # specify tdis
+    tdis = flopy.mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", 
+                                 nper=nper, perioddata=perioddata)
+
+    # specify ims pkg 
+    ims = flopy.mf6.ModflowIms(sim, pname="ims", 
+                               complexity="COMPLEX")
+
+    # start model build to refine 
+    model_nam_file = "{}.nam".format(model_name)
+    gwf = flopy.mf6.ModflowGwf(sim, modelname=model_name, 
+                               model_nam_file=model_nam_file, exe_name='mf6')
+
+    # make dis
+    dis = make_dis(gwf)
+    nlay = dis.nlay.get_data()
+    nrow = dis.nrow.get_data()
+    ncol = dis.ncol.get_data()
+
+    # get properties
     botm96 = np.zeros((nlay, nrow, ncol))
     ibnd96 = np.ones((nlay, nrow, ncol))
     thick96 = np.zeros((nlay, nrow, ncol))
@@ -108,6 +135,11 @@ def build_gwf(model_name = "dizon36"):
     k33 = np.zeros((nlay, nrow, ncol))
     vcont96 = np.zeros((nlay, nrow, ncol))
 
+    # now let's start filling data from the mf96 arrays to populate the mf6 model
+    layer_txt_files = ['layer_1.txt', 'layer_2.txt', 'layer_3.txt', 'layer_4.txt', 
+                    'layer_5.txt', 'layer_6.txt', 'layer_7.txt', 'layer_8.txt', 
+                    'layer_9.txt', 'layer_10.txt', 'layer_11.txt', 'layer_12.txt']
+    
     for i, layer_txt_files in enumerate(layer_txt_files):
         botm96[i] = reformat_arrays(os.path.join(dis_ws, 'bottoms', layer_txt_files), 
                                     os.path.join(dis_ws, 'bottoms', 'format_'+str(layer_txt_files)), 
@@ -133,26 +165,38 @@ def build_gwf(model_name = "dizon36"):
                                     os.path.join(props_ws, 'vcont', 'format_'+str(layer_txt_files)), 
                                     nrow, 
                                     ncol)
-        
+
+    # first load in mf96 top elev array reformt and assign to mf6 dis
+    top_elev = reformat_arrays(os.path.join(dis_ws, 'tops', 'top_elev.txt'), 
+                            os.path.join(dis_ws, 'tops', 'format_top_elev.txt'), 
+                            nrow, 
+                            ncol)
+    dis.top = top_elev # meters above mean sea level
     dis.botm = botm96 # meters above mean sea level
     dis.idomain = ibnd96
+    dis.set_all_data_external()
+
+    ihead = 0 #(meters)
+    start = ihead * np.ones((nlay, nrow, ncol))
+    ic = flopy.mf6.ModflowGwfic(gwf, pname="ic", strt=start)
+    ic.set_all_data_external()
+
+    karr=trans96/thick96
+    k33_array = calculate_vertical_conductivity(vcont96, thick96, nlay, nrow, ncol)
+
     npf = flopy.mf6.ModflowGwfnpf(
         gwf,
         icelltype=0,
-        k=k,
-        k33=k33,
+        k=karr,
+        k33=k33_array,
     )
-    npf.k = trans96/thick96
+    # npf.k = trans96/thick96
     npf.set_all_data_external()
-    # Calculate vertical hydraulic conductivity from vcont
-    k33_array = calculate_vertical_conductivity(vcont96, thick96, nlay, nrow, ncol)
-    k33 = flopy.mf6.ModflowGwfnpf(gwf, k33=k33_array)
-    k33.set_all_data_external()
-    # Create the sto package with specific storage and specific yield
+
     sto = flopy.mf6.ModflowGwfsto(gwf, ss=scoeff96/thick96, iconvert=0)
     sto.set_all_data_external()
+
     # CHD boundaries
-    ib=dis.idomain.get_data()
     l_hd= 0
     chdspd = []
 
@@ -215,6 +259,7 @@ def build_gwf(model_name = "dizon36"):
     budget_filerecord = [budgetfile]
     saverecord = [("HEAD", "ALL"), ("BUDGET", "ALL")]
     printrecord = [("HEAD", "LAST")]
+    
     oc = flopy.mf6.ModflowGwfoc(
         gwf,
         saverecord=saverecord,
@@ -224,73 +269,41 @@ def build_gwf(model_name = "dizon36"):
     sim.write_simulation()
     return sim
 
-def run_model(sim):
-    import pyemu
-    pyemu.os_utils.run('mf6', cwd=sim.sim_path)
-
-def reformat_arrays(input_file, output_file, rows, cols):
-    # Read the content of the file
-    with open(input_file, 'r') as f:
-        content = f.read()
-
-    # Flatten the values into a 1D array and remove spaces or NaNs
-    values = [val for val in content.split() if val.strip() and val.lower() != 'nan']
-
-    # Convert values to a numpy array
-    values_array = np.array(values)
-
-    # Ensure the array can be reshaped to the desired shape
-    if len(values_array) != rows * cols:
-        raise ValueError("The number of values does not match the specified shape")
-
-    # Reshape the array into the specified shape
-    reshaped_array = values_array.reshape((rows, cols))
-
-    # Save the reshaped array to a new file with _format extension
-    np.savetxt(output_file, reshaped_array, fmt='%s')
-    
-    # return reshaped array
-    return reshaped_array
-
-def calculate_vertical_conductivity(vcont, thickness, nlay, nrow, ncol):
-    nlay, nrow, ncol = vcont.shape
-    k33 = np.zeros((nlay, nrow, ncol))
-
-    for i in range(nlay - 1):
-        for j in range(nrow):
-            for k in range(ncol):
-                k33[i, j, k] = vcont[i, j, k] * ((thickness[i, j, k] / 2) + (thickness[i + 1, j, k] / 2))
-    # Set the vertical hydraulic conductivity of layer 12 equal to layer 11
-    k33[-1] = k33[-2]
-    
-    return k33
-
 
 ######## transport ###############
-    
-# transport model parameters
-# ne = 0.35 # effective porosity (-) constant across all layers
-# long_disp = 0.01 # Longitudinal dispersivity (m)constant across all layers
-# disp_tr_vert = long_disp*0.01 # Transverse vertical dispersivity (m) constant across all layers
-# disp_tr_hor = long_disp*0.1 # Transverse horizontal dispersivity (m) constant across all layers
-# diffc = 0 # diffusion coefficient constant across all layers
-# pbulk = 1850 # bulk density in constant across all layers (m/L^3)
 
-# transport_parameters = {
+def make_gwt(gwf):
 
-#     'ne':           [ne, ne, ne, ne, ne, ne,
-#                      ne, ne, ne, ne, ne, ne],
-#     'long_disp':    [long_disp, long_disp, long_disp, long_disp, long_disp, long_disp,
-#                      long_disp, long_disp, long_disp, long_disp, long_disp, long_disp],
-#     'disp_tr_vert': [disp_tr_vert, disp_tr_vert, disp_tr_vert, disp_tr_vert, disp_tr_vert, disp_tr_vert, 
-#                      disp_tr_vert, disp_tr_vert, disp_tr_vert, disp_tr_vert, disp_tr_vert, disp_tr_vert],
-#     'disp_tr_hor':  [disp_tr_hor, disp_tr_hor, disp_tr_hor, disp_tr_hor, disp_tr_hor, disp_tr_hor, 
-#                      disp_tr_hor, disp_tr_hor, disp_tr_hor, disp_tr_hor, disp_tr_hor, disp_tr_hor],
-#     'diffc':        [diffc, diffc, diffc, diffc, diffc, diffc, 
-#                      diffc, diffc, diffc, diffc, diffc, diffc],
-#     'pbulk':        [pbulk, pbulk, pbulk, pbulk, pbulk, pbulk, 
-#                      pbulk, pbulk, pbulk, pbulk, pbulk, pbulk]
-# }
+    nlay = gwf.dis.nlay.get_data()
+
+    ne = 0.35 # effective porosity (-) constant across all layers
+    long_disp = 0.01 # Longitudinal dispersivity (m)constant across all layers
+    disp_tr_vert = long_disp*0.01 # Transverse vertical dispersivity (m) constant across all layers
+    disp_tr_hor = long_disp*0.1 # Transverse horizontal dispersivity (m) constant across all layers
+    diffc = 0 # diffusion coefficient constant across all layers
+    pbulk = 1850 # bulk density in constant across all layers (m/L^3) 
+
+
+    ne = 0.35              # effective porosity (-)
+    long_disp = 0.01       # longitudinal dispersivity (m)
+    disp_tr_vert = long_disp * 0.01  # transverse vertical dispersivity (m)
+    disp_tr_hor = long_disp * 0.1    # transverse horizontal dispersivity (m)
+    diffc = 0              # diffusion coefficient
+    pbulk = 1850           # bulk density (m/L^3)
+
+    transport_parameters = {
+        'ne':           [ne] * nlay,
+        'long_disp':    [long_disp] * nlay,
+        'disp_tr_vert': [disp_tr_vert] * nlay,
+        'disp_tr_hor':  [disp_tr_hor] * nlay,
+        'diffc':        [diffc] * nlay,
+        'pbulk':        [pbulk] * nlay,
+    }
+
+    print(transport_parameters)
+
+
+
 
 # lin_sorp_distr_coeff = {
 
@@ -505,7 +518,9 @@ def calculate_vertical_conductivity(vcont, thickness, nlay, nrow, ncol):
 # phreeqc_rm.RunFile(True, True, True, pqi_fpth)
 
 def main():
-    sim = build_gwf()
-    run_model(sim)
+    sim = make_gwf()
+    gwf = sim.get_model('dizon36')
+    make_gwt(gwf)
+    # run_model(sim)
 if __name__ == "__main__":
     main()
