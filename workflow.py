@@ -6,13 +6,56 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import flopy
 import itertools
-from mf6rtm import utils
+from mf6rtm import utils, mup3d
 from collections import defaultdict
 from flopy.utils.gridintersect import GridIntersect
+from collections.abc import Iterable
 
 datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
 props_ws = os.path.join(datadir, 'props')
+
+
+def append_values_to_inner_lists(d, values, *, in_place=False):
+    """
+    Append a single value or all values from an iterable to every inner list
+    inside a {key: list[list]} dictionary.
+
+    Parameters
+    ----------
+    d : dict
+        Your nested‑list dictionary.
+    values : any or Iterable
+        * If `values` is not an Iterable (or is str/bytes), it’s treated as a
+          single item and appended once.
+        * If `values` is an Iterable (list/tuple/set/range…), each element is
+          appended in order.
+    in_place : bool, default False
+        True  → modify `d` directly and return it.  
+        False → leave `d` unchanged and return a *new* dictionary.
+
+    Returns
+    -------
+    dict
+        The dictionary with updated inner lists.
+    """
+    # Decide whether to work on the original or a shallow copy
+    target = d if in_place else {k: [lst[:] for lst in v] for k, v in d.items()}
+
+    # Determine if we have “one thing” or “many things”
+    is_iterable = (
+        isinstance(values, Iterable) and
+        not isinstance(values, (str, bytes))  # treat strings/bytes as scalars
+    )
+
+    for outer in target.values():
+        for inner in outer:
+            if is_iterable:
+                inner.extend(values)   # add every element in order
+            else:
+                inner.append(values)   # add the single value
+
+    return target
 
 def run_model(sim):
     import pyemu
@@ -61,7 +104,7 @@ def calculate_vertical_conductivity(vcont, thickness, nlay, nrow, ncol):
 
 def make_obs_pack(gwf):
     ix = GridIntersect(gwf.modelgrid)
-    obsloc = pd.read_csv(os.path.join("data", "obs_loc.csv"))
+    obsloc = pd.read_csv(os.path.join(datadir, "obs_loc.csv"))
 
     obs_list=[]
 
@@ -131,14 +174,248 @@ def make_dis(gwf):
     dis.set_all_data_external()
     return dis
 
-def make_gwf(model_name = "gwf"):
-    model_ws = os.path.join("model")
+def initialize_chemistry(ws, nlay, nrow, ncol):
+    # get chemistry
+
+    solutionsdf = pd.read_csv(os.path.join(datadir,"ic_aq_chem.csv"), index_col = 0)
+
+    ## let's process the injection chem
+    injdf = pd.read_csv(os.path.join(datadir,"wellin.csv"), index_col = 0)
+    injdf = injdf[['layer'] + solutionsdf.index.tolist()].copy()
+    injdf
+    layers_inj = list(injdf.layer.unique())
+
+    frames = []                     
+
+    for per in injdf.index.unique():
+        df = (
+            injdf.loc[per].reset_index()      
+                .drop(columns='kper')        
+                .groupby('layer').mean()    
+                .T                          
+        )
+        # give columns names like  0_1, 0_2, …   (or f"{per}_{layer}")
+        df.columns = [f"{per}_{layer}" for layer in df.columns]
+
+        frames.append(df)            
+
+    injdf = pd.concat(frames, axis=1) 
+    solutionsdf = pd.concat([solutionsdf, injdf], axis=1)
+
+    solutions = utils.solution_df_to_dict(solutionsdf)
+
+    sol_ic = np.ones((nlay, nrow, ncol), dtype=float)
+
+    solution = mup3d.Solutions(solutions)
+    solution.set_ic(sol_ic)
+    solution
+
+    excdf = pd.read_csv(os.path.join(os.path.join(datadir,"ic_exchanger.csv")), comment = '#')
+    ex_names = {
+                "Ca_ex": "CaX2",
+                "Fe_ex":"FeX2" ,
+                "K_ex":"KX" ,
+                "Mg_ex":"MgX2", 
+                "Na_ex":"NaX"
+                }
+    # we need to rename to match the database
+    excdf['name'] = excdf['var'].map(ex_names)
+    excdf = excdf.pivot(index="name", columns="layer", values="value")
+
+    exchangerdic = utils.solution_df_to_dict(excdf)
+    exchanger = mup3d.ExchangePhases(exchangerdic)
+
+    # exchanger_ic = np.ones((nlay, nrow, ncol), dtype=float)
+    layer_vals = np.arange(1, nlay + 1, dtype=float)   # shape (nlay,)
+
+    # Broadcast to full 3‑D grid
+    exchanger_ic = layer_vals[:, None, None] * np.ones((1, nrow, ncol))
+    exchanger.set_ic(exchanger_ic)
+
+    # we need to equilibrate the exchangers with the background solution
+    # init background solution is the same (number 1) for the whole domain
+    # the next array has a length of nlay, one for each layer
+    eq_solutions = [1] * nlay
+    exchanger.set_equilibrate_solutions(eq_solutions)
+
+    mindf = pd.read_csv(os.path.join(os.path.join(datadir,"ic_surfaces.csv")), comment = '#')
+    mindf = mindf.pivot(index="var", columns="layer", values="value")
+    
+    # only ferrihydrite and orgmatter are in eq
+    eq_m0 = utils.solution_df_to_dict(mindf.loc[['Ferrihydrite', "Orgmatter"],:])
+
+    # we need the initial Sat indeces SI
+    # following original model init SI is 0
+    si = 0
+
+    eq_dic = {}
+    #lets add pyrite first
+    for ly in range(nlay):
+        # si followed by m0 (init moles)
+        eq_dic[ly+1] = {key: [si, eq_m0[key][ly]] for key in eq_m0.keys()}
+    eq_dic
+    equilibriums = mup3d.EquilibriumPhases(eq_dic)
+    equilibriums.set_ic(exchanger_ic)
+
+    # pyrite is kinetic
+    py_m0 = utils.solution_df_to_dict(mindf.loc[["Pyrite"],:])
+
+    # we need the kinetic params for Py
+    kin_py_params = [1.600000e+01, 
+                     6.700000e-01, 
+                     5.000000e-01, 
+                     -1.100000e-01]
+    kin_dic = {}
+
+    # lets add kinetics for Organic carbon (Orgc)
+    kin_orgc_params = [1.570000e-09, 1.670000e-11, 1.000000e-13]
+    # orgc also have a custom formula
+    orgc_form =  "Orgc -1.0 CH2O 1.0"
+
+    #lets add pyrite first
+    for ly in range(nlay):
+        # print(ly+1)
+        for key in py_m0.keys():
+            kin_dic[ly+1] = {key: [py_m0[key][ly], kin_py_params]}
+    kin_dic
+
+    # lets add orgc now with a m0 of zero for all layers
+    for key in kin_dic.keys():
+        kin_dic[key]['Orgc'] = [0.0, kin_orgc_params, orgc_form]
+    kin_dic
+    kinetics = mup3d.KineticPhases(kin_dic)
+    kinetics.set_ic(exchanger_ic)
+    kinetics.data
+
+    model = mup3d.Mup3d('dizon36',solution, nlay, nrow, ncol)
+
+
+    # #set model workspace
+    model.set_wd(ws)
+
+    # set database
+    database = os.path.join(datadir, f'datab.dat')
+    model.set_database(database)
+
+    postfix = os.path.join(datadir, f'postfix.phqr')
+    model.set_postfix(postfix)
+    model.set_exchange_phases(exchanger)
+    model.set_phases(kinetics)
+    model.set_phases(equilibriums)
+
+    model.initialize()
+
+    return model
+
+def make_wel_in(gwf, one_compound = None, mup3d_m=None, nper=39):
+    coords_in = [
+        (1, 9, 38),
+        (2, 9, 38),
+        (3, 9, 38),
+        (5, 9, 38),
+        (7, 9, 38),
+    ]
+    layers_inj = [i[0] for i in coords_in]
+
+    df_inj = pd.read_csv(os.path.join(datadir, "wellin.csv"))
+    wellin_sp_data = defaultdict(list)
+
+    if one_compound is not None:
+        assert one_compound in df_inj.columns, print("compound not in wellin csv")
+        for _, r in df_inj.iterrows():
+            cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
+            wellin_sp_data[int(r["kper"])].append([cell, r["rate"], r[f"{one_compound}"]])
+        wel_in  = flopy.mf6.ModflowGwfwel(gwf, 
+                                       stress_period_data=wellin_sp_data,
+                                       auxiliary=one_compound,
+                                       pname = 'welin',
+                                       filename=f'{gwf.name}.welin')
+        wel_in.set_all_data_external()
+
+    else:
+        wel_chem_dir = {}
+        indices = [list(range(i, i + 5)) for i in range(2, 197, 5)]
+        for per in range(nper):
+            sol_spd = indices[per]
+            wellchem = mup3d.ChemStress('per_'+str(per))
+            wellchem.set_spd(sol_spd)
+            mup3d_m.set_chem_stress(wellchem)
+            wel_chem_dir[per] = wellchem.data
+
+        for _, r in df_inj.iterrows():
+            cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
+            wellin_sp_data[int(r["kper"])].append([cell, r["rate"]])
+
+        for per in range(nper):
+            for e, layer in  enumerate(layers_inj):
+                chem_arr = wel_chem_dir[per][e]
+                wellin_sp_data[per][e].extend(chem_arr)
+        wel_in  = flopy.mf6.ModflowGwfwel(gwf, 
+                                        stress_period_data=wellin_sp_data,
+                                        auxiliary=mup3d_m.components,
+                                        pname = 'welin',
+                                        filename=f'{gwf.name}.welin')
+        wel_in.set_all_data_external()
+        return wel_in
+
+def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39):
+
+    coords_out = [ # (row, col, layer) 
+        (1, 9,  9),
+        (3, 9,  9),
+        (5, 9,  9),
+    ]
+    init_rates_out  = [-300,  -30,  -30]                # 3 negatives
+    fini_rates_out  = [-400,  -40,  -40]
+
+    init_sp = range(0, 36)   # stress periods 0 – 35
+    fini_sp = range(36, nper)  # stress periods 36 – 38
+    all_sp  = (*init_sp, *fini_sp)
+
+
+    def make_rows(coords, rates, add_conc=True):
+        if len(coords) != len(rates):
+            raise ValueError("Coordinate and rate lists must be the same length")
+        return [
+            ([cell, q] if add_conc else [cell, q])
+            for cell, q in zip(coords, rates)
+        ]
+
+    # Time‑invariant blocks for each phase
+    wellout_init  = make_rows(coords_out, init_rates_out)
+    wellout_fini  = make_rows(coords_out, fini_rates_out, add_conc=True)
+    wellout_sp_data = {sp: (wellout_init if sp in init_sp else wellout_fini)
+                    for sp in all_sp}
+
+    if one_compound is not None:
+        wellout_sp_data = append_values_to_inner_lists(wellout_sp_data, 0.0)
+        wel_out = flopy.mf6.ModflowGwfwel(gwf, 
+                                            stress_period_data=wellout_sp_data, 
+                                            auxiliary=one_compound,
+                                            pname = 'welout' ,
+                                            filename=f'{gwf.name}.welout')
+        wel_out.set_all_data_external()
+    else:
+        wellout_sp_data = append_values_to_inner_lists(wellout_sp_data, [0.0]*len(mup3d_m.components))
+        wel_out = flopy.mf6.ModflowGwfwel(gwf, 
+                                            stress_period_data=wellout_sp_data, 
+                                            auxiliary=mup3d_m.components,
+                                            pname = 'welout' ,
+                                            filename=f'{gwf.name}.welout')
+        wel_out.set_all_data_external()
+    return wel_out
+
+def prep_model_dir(name="model"):
+    model_ws = os.path.join(name)
     if os.path.exists(model_ws):
         shutil.rmtree(model_ws)
 
     # Re‑create an empty folder
     os.makedirs(model_ws, exist_ok=True)
     utils.prep_bins(model_ws)
+    return os.path.join(name)
+
+def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
 
     nper = 39  # Number of stress periods
 
@@ -155,7 +432,7 @@ def make_gwf(model_name = "gwf"):
 
     # specify the mf6 gw object & add relevant components
     sim = flopy.mf6.MFSimulation(sim_name=model_name, version='mf6', sim_ws='.')
-    sim.set_sim_path(model_ws)
+    sim.set_sim_path(ws)
 
     # specify tdis
     tdis = flopy.mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", 
@@ -250,61 +527,9 @@ def make_gwf(model_name = "gwf"):
     )
     chd.set_all_data_external()
 
-    coords_out = [ # (row, col, layer) 
-        (1, 9,  9),
-        (3, 9,  9),
-        (5, 9,  9),
-    ]
-
-    coords_in = [
-        (1, 9, 38),
-        (2, 9, 38),
-        (3, 9, 38),
-        (5, 9, 38),
-        (7, 9, 38),
-    ]
-
-    init_rates_out  = [-300,  -30,  -30]                # 3 negatives
-    fini_rates_out  = [-400,  -40,  -40]
-
-    init_sp = range(0, 36)   # stress periods 0 – 35
-    fini_sp = range(36, 39)  # stress periods 36 – 38
-    all_sp  = (*init_sp, *fini_sp)
-
-    df_inj = pd.read_csv(os.path.join(datadir, "wellin.csv"))
-    
-    wellin_sp_data = defaultdict(list)
-
-    for _, r in df_inj.iterrows():
-        cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
-        wellin_sp_data[int(r["kper"])].append([cell, r["rate"], r["Cl"]])
-
-    def make_rows(coords, rates, add_conc=True):
-        if len(coords) != len(rates):
-            raise ValueError("Coordinate and rate lists must be the same length")
-        return [
-            ([cell, q, 0.0] if add_conc else [cell, q])
-            for cell, q in zip(coords, rates)
-        ]
-
-    # Time‑invariant blocks for each phase
-    wellout_init  = make_rows(coords_out, init_rates_out)
-    wellout_fini  = make_rows(coords_out, fini_rates_out, add_conc=True)
-    wellout_sp_data = {sp: (wellout_init if sp in init_sp else wellout_fini)
-                    for sp in all_sp}
-    
-    wel_in  = flopy.mf6.ModflowGwfwel(gwf, 
-                                       stress_period_data=wellin_sp_data,
-                                       auxiliary='Cl',
-                                       pname = 'welin',
-                                       filename=f'{model_name}.welin')
-    wel_in.set_all_data_external()
-    wel_out = flopy.mf6.ModflowGwfwel(gwf, 
-                                       stress_period_data=wellout_sp_data, 
-                                       auxiliary='Cl',
-                                       pname = 'welout' ,
-                                       filename=f'{model_name}.welout')
-    wel_out.set_all_data_external()
+    wel_out = make_wel_out(gwf, nper =39, one_compound=tracer, mup3d_m=mup3d_m)
+    # make wel in
+    wel_in = make_wel_in(gwf, nper =39, one_compound=tracer, mup3d_m=mup3d_m)
 
     # create the output control
     headfile = f"{model_name}.hds"
@@ -326,7 +551,7 @@ def make_gwf(model_name = "gwf"):
 
 ######## transport ###############
 
-def make_gwt(sim, model_name = 'gwt'):
+def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
 
     gwf = sim.get_model("gwf")
     nlay = gwf.dis.nlay.get_data()
@@ -346,133 +571,121 @@ def make_gwt(sim, model_name = 'gwt'):
     diffc = 0              # diffusion coefficient
     pbulk = 1850           # bulk density (m/L^3)
 
-    # transport_parameters = {
-    #     'ne':           [ne] * nlay,
-    #     'long_disp':    [long_disp] * nlay,
-    #     'disp_tr_vert': [disp_tr_vert] * nlay,
-    #     'disp_tr_hor':  [disp_tr_hor] * nlay,
-    #     'diffc':        [diffc] * nlay,
-    #     'pbulk':        [pbulk] * nlay,
-    # }
+    if mup3d_m is not None:
+        components = mup3d_m.components
+    else:
+        components = [tracer]
 
-    # print(transport_parameters)
-
-    gwt = flopy.mf6.MFModel(
-        sim,
-        model_type="gwt6",
-        modelname=model_name,
-        model_nam_file=f"{model_name}.nam"
-    )
-
-    imsgwt = flopy.mf6.ModflowIms(sim, 
-                                #   pname="ims", 
-                            complexity="COMPLEX",
-                            filename=f"{model_name}.ims")
-    sim.register_ims_package(imsgwt, 
-                             [model_name])
-    
-    # nper = sim.tdis.nper.get_data()
-    # perioddata = sim.tdis.perioddata.get_data()
-    # start_date_time = sim.tdis.start_date_time.get_data()
-
-    # tdis = flopy.mf6.ModflowTdis(sim, pname="tdis",
-    #                                 nper=nper, 
-    #                                 perioddata=perioddata, #gwt_perioddata,
-    #                                 time_units='days', 
-    #                                 start_date_time=start_date_time)
-
-    dis = gwf.dis
-
-    dis = flopy.mf6.ModflowGwtdis(
-            gwt,
-            nlay=gwf.dis.nlay.get_data(),
-            nrow=gwf.dis.nrow.get_data(),
-            ncol=gwf.dis.ncol.get_data(),
-            delr=gwf.dis.delr.get_data(),
-            delc=gwf.dis.delc.get_data(),
-            top=gwf.dis.top.get_data(),
-            botm=gwf.dis.botm.get_data(),
-            idomain=gwf.dis.idomain.get_data(),
-            filename=f"{model_name}.dis",
-            xorigin=gwf.dis.xorigin.get_data(),
-            yorigin=gwf.dis.yorigin.get_data()
+    for comp in components:
+        model_name = comp
+        gwt = flopy.mf6.MFModel(
+            sim,
+            model_type="gwt6",
+            modelname=model_name,
+            model_nam_file=f"{model_name}.nam"
         )
-    dis.set_all_data_external()
 
-    nlay = dis.nlay.get_data()
-    nrow = dis.nrow.get_data()
-    ncol = dis.ncol.get_data()
+        imsgwt = flopy.mf6.ModflowIms(sim, 
+                                    #   pname="ims", 
+                                complexity="COMPLEX",
+                                filename=f"{model_name}.ims")
+        sim.register_ims_package(imsgwt, 
+                                [model_name])
 
-    strt = np.ones(shape=(nlay,ncol, nrow))*0.000254
-    ic = flopy.mf6.ModflowGwtic(gwt, strt=strt, 
-                                filename=f"{model_name}.ic")
-    ic.set_all_data_external()
+        dis = gwf.dis
 
-    adv = flopy.mf6.ModflowGwtadv(
-        gwt,
-        scheme="tvd",
-    )
-    adv.set_all_data_external()
+        dis = flopy.mf6.ModflowGwtdis(
+                gwt,
+                nlay=gwf.dis.nlay.get_data(),
+                nrow=gwf.dis.nrow.get_data(),
+                ncol=gwf.dis.ncol.get_data(),
+                delr=gwf.dis.delr.get_data(),
+                delc=gwf.dis.delc.get_data(),
+                top=gwf.dis.top.get_data(),
+                botm=gwf.dis.botm.get_data(),
+                idomain=gwf.dis.idomain.get_data(),
+                filename=f"{model_name}.dis",
+                xorigin=gwf.dis.xorigin.get_data(),
+                yorigin=gwf.dis.yorigin.get_data()
+            )
+        dis.set_all_data_external()
 
-    alpha_l = np.ones(shape=(nlay,ncol, nrow))*long_disp  # Longitudinal dispersivity ($m$)
-    alpha_th = np.ones(shape=(nlay,ncol, nrow))*disp_tr_hor  # Transverse horizontal dispersivity ($m$)
-    alpha_tv = np.ones(shape=(nlay,ncol, nrow))*disp_tr_vert  # Transverse vertical dispersivity ($m$)
+        nlay = dis.nlay.get_data()
+        nrow = dis.nrow.get_data()
+        ncol = dis.ncol.get_data()
 
-    dsp = flopy.mf6.ModflowGwtdsp(
-        gwt,
-        xt3d_off=True,
-        alh=alpha_l,
-        ath1=alpha_th,
-        atv = alpha_tv,
-        diffc = diffc,
-        filename=f"{model_name}.dsp",
-    )
-    dsp.set_all_data_external()
+        strt = mup3d_m.sconc[comp]
+        ic = flopy.mf6.ModflowGwtic(gwt, strt=strt, 
+                                    filename=f"{model_name}.ic")
+        ic.set_all_data_external()
 
-    sourcerecarray = [["welin", "aux", f"Cl"],
-                      ["welout", "aux", f"Cl"]]
-
-    ssm = flopy.mf6.ModflowGwtssm(
+        adv = flopy.mf6.ModflowGwtadv(
             gwt,
-            sources=sourcerecarray,
-            save_flows=True,
-            print_flows=True,
-            filename=f"{model_name}.ssm",
+            scheme="tvd",
         )
-    ssm.set_all_data_external()
+        adv.set_all_data_external()
 
-    mst = flopy.mf6.ModflowGwtmst(
-        gwt,
-        porosity=ne,
-        first_order_decay=None,
-        decay = None,
-        decay_sorbed=None,
-        sorption= None,
-        bulk_density=pbulk, 
-        distcoef=None, #Kd m3/mg
-        sp2 = None,
-        filename=f"{model_name}.mst",
-    )
-    mst.set_all_data_external()
-    oc = flopy.mf6.ModflowGwtoc(
-        gwt,
-        budget_filerecord=f"{model_name}.cbb",
-        concentration_filerecord=f"{model_name}.ucn",
-        concentrationprintrecord=[("COLUMNS", 10, "WIDTH", 15, "DIGITS", 10, "GENERAL")
-                                    ],
-        saverecord=[("CONCENTRATION", "ALL"), 
-                    ],
-        printrecord=[("CONCENTRATION", "LAST"), 
+        alpha_l = np.ones(shape=(nlay,ncol, nrow))*long_disp  # Longitudinal dispersivity ($m$)
+        alpha_th = np.ones(shape=(nlay,ncol, nrow))*disp_tr_hor  # Transverse horizontal dispersivity ($m$)
+        alpha_tv = np.ones(shape=(nlay,ncol, nrow))*disp_tr_vert  # Transverse vertical dispersivity ($m$)
+
+        dsp = flopy.mf6.ModflowGwtdsp(
+            gwt,
+            xt3d_off=True,
+            alh=alpha_l,
+            ath1=alpha_th,
+            atv = alpha_tv,
+            diffc = diffc,
+            filename=f"{model_name}.dsp",
+        )
+        dsp.set_all_data_external()
+
+        sourcerecarray = [["welin", "aux", model_name],
+                        ["welout", "aux", model_name]]
+
+        ssm = flopy.mf6.ModflowGwtssm(
+                gwt,
+                sources=sourcerecarray,
+                save_flows=True,
+                print_flows=True,
+                filename=f"{model_name}.ssm",
+            )
+        ssm.set_all_data_external()
+
+        mst = flopy.mf6.ModflowGwtmst(
+            gwt,
+            porosity=ne,
+            first_order_decay=None,
+            decay = None,
+            decay_sorbed=None,
+            sorption= None,
+            bulk_density=None, 
+            distcoef=None, #Kd m3/mg
+            sp2 = None,
+            filename=f"{model_name}.mst",
+        )
+        mst.set_all_data_external()
+        oc = flopy.mf6.ModflowGwtoc(
+            gwt,
+            budget_filerecord=f"{model_name}.cbb",
+            concentration_filerecord=f"{model_name}.ucn",
+            concentrationprintrecord=[("COLUMNS", 10, "WIDTH", 15, "DIGITS", 10, "GENERAL")
+                                        ],
+            saverecord=[("CONCENTRATION", "ALL"), 
                         ],
-    )
-    flopy.mf6.ModflowGwfgwt(
-        sim,
-        exgtype="GWF6-GWT6",
-        exgmnamea='gwf',
-        exgmnameb=f'{model_name}',
-        filename=f"{model_name}.gwfgwt",
-    )
-    make_obs_pack(gwt)
+            printrecord=[("CONCENTRATION", "LAST"), 
+                            ],
+        )
+        flopy.mf6.ModflowGwfgwt(
+            sim,
+            exgtype="GWF6-GWT6",
+            exgmnamea='gwf',
+            exgmnameb=f'{model_name}',
+            filename=f"{model_name}.gwfgwt",
+        )
+        make_obs_pack(gwt)
+    
+    
     sim.write_simulation() 
     return sim
 # lin_sorp_distr_coeff = {
@@ -688,8 +901,13 @@ def make_gwt(sim, model_name = 'gwt'):
 # phreeqc_rm.RunFile(True, True, True, pqi_fpth)
 
 def main():
-    sim = make_gwf()
-    sim = make_gwt(sim, model_name='Cl')
+    ws = prep_model_dir()
+    nlay = 12
+    nrow = 10
+    ncol = 51
+    mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
+    sim = make_gwf(ws, tracer=None,mup3d_m=mup3d_m)
+    sim = make_gwt(sim, tracer='Cl', mup3d_m=mup3d_m)
     run_model(sim)
 if __name__ == "__main__":
     main()
