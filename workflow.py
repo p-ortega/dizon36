@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import flopy
 import itertools
+import pyemu
 from mf6rtm import utils, mup3d
 from collections import defaultdict
 from flopy.utils.gridintersect import GridIntersect
@@ -58,7 +59,6 @@ def append_values_to_inner_lists(d, values, *, in_place=False):
     return target
 
 def run_model(sim):
-    import pyemu
     pyemu.os_utils.run('mf6', cwd=sim.sim_path)
 
 def reformat_arrays(input_file, rows, cols, save_file=False):
@@ -122,7 +122,7 @@ def make_obs_pack(gwf):
 
     # obs_recarray = {'obs.head.sim.csv':obs_list}
     obs_recarray = {f'obs_{gwf.name}.csv':obs_list}
-    print(obs_list)
+    # print(obs_list)
     obs_package = flopy.mf6.ModflowUtlobs(gwf, 
                                         digits=0, #print_input=True,
                                         pname=f'obs_{gwf.name}',
@@ -405,6 +405,49 @@ def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39):
         wel_out.set_all_data_external()
     return wel_out
 
+def make_chd(gwf, one_compound = None, mup3d_m=None):
+    
+    l_hd= 0
+    nlay = gwf.dis.nlay.get_data()
+    nrow = gwf.dis.nrow.get_data()
+    ncol = gwf.dis.ncol.get_data()
+
+    if one_compound is not None:
+        df_inj = pd.read_csv(os.path.join(datadir, "ic_aq_chem.csv"), index_col=0)
+        assert one_compound in df_inj.index, f"compound {one_compound} not in ic_aq_chem csv"
+        c_list = [df_inj.loc[one_compound, 'value']]
+        aux = one_compound
+        # print(c_list)
+    else:
+        chdchem = mup3d.ChemStress('chdchem')
+        sol_spd = [1]
+        chdchem.set_spd(sol_spd)
+        mup3d_m.set_chem_stress(chdchem)
+        c_list = mup3d_m.chdchem.data[0]
+        aux=mup3d_m.components
+
+    chdspd = []
+    for i in range(nlay):          # layers
+        for j in range(nrow):      # rows
+            chdspd.append([(i, j, 0), l_hd])           # left boundary
+            chdspd.append([(i, j, ncol - 1), l_hd])    # right boundary
+    # print(chdspd)
+    for i in range(len(chdspd)):
+        chdspd[i].extend(c_list)
+
+    # print(chdspd)
+    chd = flopy.mf6.ModflowGwfchd(
+        gwf,
+        maxbound=len(chdspd),
+        stress_period_data=chdspd,
+        save_flows=True,
+        auxiliary=aux,
+        pname="CHD",
+        filename=f"{gwf.name}.chd",
+    )
+    chd.set_all_data_external()
+    return chdspd
+
 def prep_model_dir(name="model"):
     model_ws = os.path.join(name)
     if os.path.exists(model_ws):
@@ -509,23 +552,24 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
     sto.set_all_data_external()
 
     # CHD boundaries
-    l_hd= 0
-    chdspd = []
+    # l_hd= 0
+    # chdspd = []
 
-    for i in range(nlay):          # layers
-        for j in range(nrow):      # rows
-            chdspd.append([(i, j, 0), l_hd])           # left boundary
-            chdspd.append([(i, j, ncol - 1), l_hd])    # right boundary
+    # for i in range(nlay):          # layers
+    #     for j in range(nrow):      # rows
+    #         chdspd.append([(i, j, 0), l_hd])           # left boundary
+    #         chdspd.append([(i, j, ncol - 1), l_hd])    # right boundary
 
-    chd = flopy.mf6.ModflowGwfchd(
-        gwf,
-        maxbound=len(chdspd),
-        stress_period_data=chdspd,
-        save_flows=True,
-        pname="CHD",
-        filename=f"{model_name}.chd",
-    )
-    chd.set_all_data_external()
+    # chd = flopy.mf6.ModflowGwfchd(
+    #     gwf,
+    #     maxbound=len(chdspd),
+    #     stress_period_data=chdspd,
+    #     save_flows=True,
+    #     pname="CHD",
+    #     filename=f"{model_name}.chd",
+    # )
+    # chd.set_all_data_external()
+    chd = make_chd(gwf, one_compound=tracer, mup3d_m=mup3d_m)
 
     wel_out = make_wel_out(gwf, nper =39, one_compound=tracer, mup3d_m=mup3d_m)
     # make wel in
@@ -571,7 +615,7 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
     diffc = 0              # diffusion coefficient
     pbulk = 1850           # bulk density (m/L^3)
 
-    if mup3d_m is not None:
+    if mup3d_m is not None and tracer is None:
         components = mup3d_m.components
     else:
         components = [tracer]
@@ -613,8 +657,10 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         nlay = dis.nlay.get_data()
         nrow = dis.nrow.get_data()
         ncol = dis.ncol.get_data()
-
-        strt = mup3d_m.sconc[comp]
+        if tracer is not None:
+            strt = mup3d_m.sconc[comp]/1000 # to mmol
+        else:
+            strt = mup3d_m.sconc[comp]
         ic = flopy.mf6.ModflowGwtic(gwt, strt=strt, 
                                     filename=f"{model_name}.ic")
         ic.set_all_data_external()
@@ -641,7 +687,8 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         dsp.set_all_data_external()
 
         sourcerecarray = [["welin", "aux", model_name],
-                        ["welout", "aux", model_name]]
+                        ["welout", "aux", model_name],
+                        ["chd", "aux", model_name]]
 
         ssm = flopy.mf6.ModflowGwtssm(
                 gwt,
@@ -906,8 +953,11 @@ def main():
     nrow = 10
     ncol = 51
     mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    sim = make_gwf(ws, tracer=None,mup3d_m=mup3d_m)
-    sim = make_gwt(sim, tracer='Cl', mup3d_m=mup3d_m)
-    run_model(sim)
+    tracer = None
+
+    sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
+    sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
+    # run_model(sim)
+    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
 if __name__ == "__main__":
     main()
