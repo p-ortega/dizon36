@@ -271,6 +271,7 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     kin_orgc_params = [1.570000e-09, 1.670000e-11, 1.000000e-13]
     # orgc also have a custom formula
     orgc_form =  "Orgc -1.0 CH2O 1.0"
+    orgc_steps = "8.640000e+04 in 1 steps"
 
     #lets add pyrite first
     for ly in range(nlay):
@@ -281,7 +282,7 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
 
     # lets add orgc now with a m0 of zero for all layers
     for key in kin_dic.keys():
-        kin_dic[key]['Orgc'] = [0.0, kin_orgc_params, orgc_form]
+        kin_dic[key]['Orgc'] = [0.0, kin_orgc_params, orgc_form, orgc_steps]
     kin_dic
     kinetics = mup3d.KineticPhases(kin_dic)
     kinetics.set_ic(exchanger_ic)
@@ -400,8 +401,9 @@ def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39):
         wel_out = flopy.mf6.ModflowGwfwel(gwf, 
                                             stress_period_data=wellout_sp_data, 
                                             auxiliary=mup3d_m.components,
-                                            pname = 'welout' ,
+                                            pname = 'welout',
                                             filename=f'{gwf.name}.welout')
+        
         wel_out.set_all_data_external()
     return wel_out
 
@@ -449,14 +451,14 @@ def make_chd(gwf, one_compound = None, mup3d_m=None):
     return chdspd
 
 def prep_model_dir(name="model"):
-    model_ws = os.path.join(name)
+    model_ws = os.path.join("model", name)
     if os.path.exists(model_ws):
         shutil.rmtree(model_ws)
 
     # Re‑create an empty folder
     os.makedirs(model_ws, exist_ok=True)
     utils.prep_bins(model_ws)
-    return os.path.join(name)
+    return os.path.join(model_ws)
 
 def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
 
@@ -470,8 +472,6 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
                 (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
                 (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
                 (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
-
-    steady = [False] * nper  # All stress periods are transient
 
     # specify the mf6 gw object & add relevant components
     sim = flopy.mf6.MFSimulation(sim_name=model_name, version='mf6', sim_ws='.')
@@ -506,14 +506,13 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
     thick96 = np.zeros((nlay, nrow, ncol))
     scoeff96 = np.zeros((nlay, nrow, ncol))
     trans96 = np.zeros((nlay, nrow, ncol))
-    k = np.zeros((nlay, nrow, ncol))
-    k33 = np.zeros((nlay, nrow, ncol))
+    # k = np.zeros((nlay, nrow, ncol))
+    # k33 = np.zeros((nlay, nrow, ncol))
     vcont96 = np.zeros((nlay, nrow, ncol))
 
     # now let's start filling data from the mf96 arrays to populate the mf6 model
     layer_txt_files = [f"layer_{i}.txt" for i in range(1, 13)]
 
-    
     for i, layer_txt_files in enumerate(layer_txt_files):
 
         thick96[i] = reformat_arrays(os.path.join(dis_ws, 'thicknesses', layer_txt_files), 
@@ -530,7 +529,6 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
                                     ncol)
 
     # first load in mf96 top elev array reformt and assign to mf6 dis
-
     ihead = 0 #(meters)
     start = ihead * np.ones((nlay, nrow, ncol))
     ic = flopy.mf6.ModflowGwfic(gwf, pname="ic", strt=start)
@@ -544,31 +542,17 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
         icelltype=0,
         k=karr,
         k33=k33_array,
+        # k33overk = True
     )
-    # npf.k = trans96/thick96
     npf.set_all_data_external()
 
-    sto = flopy.mf6.ModflowGwfsto(gwf, ss=scoeff96/thick96, iconvert=0)
+    sto = flopy.mf6.ModflowGwfsto(gwf, 
+                                  ss=scoeff96/thick96, 
+                                  iconvert=0,
+                                    # steady_state={0: False},
+                                    transient={0: True})
     sto.set_all_data_external()
 
-    # CHD boundaries
-    # l_hd= 0
-    # chdspd = []
-
-    # for i in range(nlay):          # layers
-    #     for j in range(nrow):      # rows
-    #         chdspd.append([(i, j, 0), l_hd])           # left boundary
-    #         chdspd.append([(i, j, ncol - 1), l_hd])    # right boundary
-
-    # chd = flopy.mf6.ModflowGwfchd(
-    #     gwf,
-    #     maxbound=len(chdspd),
-    #     stress_period_data=chdspd,
-    #     save_flows=True,
-    #     pname="CHD",
-    #     filename=f"{model_name}.chd",
-    # )
-    # chd.set_all_data_external()
     chd = make_chd(gwf, one_compound=tracer, mup3d_m=mup3d_m)
 
     wel_out = make_wel_out(gwf, nper =39, one_compound=tracer, mup3d_m=mup3d_m)
@@ -589,11 +573,8 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
         head_filerecord=head_filerecord,
         budget_filerecord=budget_filerecord,
         printrecord=printrecord,)
-    # sim.write_simulation()
+
     return sim
-
-
-######## transport ###############
 
 def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
 
@@ -606,14 +587,6 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
     disp_tr_hor = long_disp*0.1 # Transverse horizontal dispersivity (m) constant across all layers
     diffc = 0 # diffusion coefficient constant across all layers
     pbulk = 1850 # bulk density in constant across all layers (m/L^3) 
-
-
-    ne = 0.35              # effective porosity (-)
-    long_disp = 0.01       # longitudinal dispersivity (m)
-    disp_tr_vert = long_disp * 0.01  # transverse vertical dispersivity (m)
-    disp_tr_hor = long_disp * 0.1    # transverse horizontal dispersivity (m)
-    diffc = 0              # diffusion coefficient
-    pbulk = 1850           # bulk density (m/L^3)
 
     if mup3d_m is not None and tracer is None:
         components = mup3d_m.components
@@ -686,9 +659,11 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         )
         dsp.set_all_data_external()
 
-        sourcerecarray = [["welin", "aux", model_name],
+        sourcerecarray = [
+                        ["welin", "aux", model_name],
                         ["welout", "aux", model_name],
-                        ["chd", "aux", model_name]]
+                        ["chd", "aux", model_name]
+                        ]
 
         ssm = flopy.mf6.ModflowGwtssm(
                 gwt,
@@ -699,15 +674,24 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             )
         ssm.set_all_data_external()
 
+        if comp=='Tmp':
+            # kd = 2*ne/1850
+            distcoef = np.ones(shape=(nlay,ncol, nrow))*2.1141E-04
+            sorption = "Linear"
+            pbulk = 1850
+        else:
+            distcoef = None
+            sorption = None
+            pbulk = None
         mst = flopy.mf6.ModflowGwtmst(
             gwt,
             porosity=ne,
             first_order_decay=None,
             decay = None,
             decay_sorbed=None,
-            sorption= None,
-            bulk_density=None, 
-            distcoef=None, #Kd m3/mg
+            sorption= sorption,
+            bulk_density=pbulk, 
+            distcoef=distcoef, #Kd m3/mg
             sp2 = None,
             filename=f"{model_name}.mst",
         )
@@ -735,229 +719,19 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
     
     sim.write_simulation() 
     return sim
-# lin_sorp_distr_coeff = {
-
-#     'Orgc':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'O(0)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'C(4)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'C(-4)':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Ca':           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Cl':           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 
-#     'Fe(2)':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Fe(3)':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'K':            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Mg':           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'N(3)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'N(5)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Na':           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'S(-2)':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'S(6)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Si':           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Amm':          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'N(0)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Tmp':          [2.1141E-04, 2.1141E-04, 2.1141E-04, 2.1141E-04, 2.1141E-04, 2.1141E-04,
-#                      2.1141E-04, 2.1141E-04, 2.1141E-04, 2.1141E-04, 2.1141E-04, 2.1141E-04],
-#     'pH':           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'pe':           [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Ferrihydrite': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Orgmatter':    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Ca_ex':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Fe_ex':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'K_ex':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Mg_ex':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Na_ex':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Pyrite':       [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-
-# }
-
-# # define initial concentration conditions in all 12 layers
-# initial_concentrations = {
-
-#     'Orgc':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'O(0)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'C(4)':         [0.008446, 0.008446, 0.008446, 0.008446, 0.008446, 0.008446, 
-#                      0.008446, 0.008446, 0.008446, 0.008446, 0.008446, 0.008446],
-#     'C(-4)':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Ca':           [0.002057, 0.002057, 0.002057, 0.002057, 0.002057, 0.002057, 
-#                      0.002057, 0.002057, 0.002057, 0.002057, 0.002057, 0.002057],
-#     'Cl':           [0.000254, 0.000254, 0.000254, 0.000254, 0.000254, 0.000254, 
-#                      0.000254, 0.000254, 0.000254, 0.000254, 0.000254, 0.000254], 
-#     'Fe(2)':        [0.0001041, 0.0001041, 0.0001041, 0.0001041, 0.0001041, 0.0001041, 
-#                      0.0001041, 0.0001041, 0.0001041, 0.0001041, 0.0001041, 0.0001041],
-#     'Fe(3)':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'K':            [0.0001336, 0.0001336, 0.0001336, 0.0001336, 0.0001336, 0.0001336,
-#                      0.0001336, 0.0001336, 0.0001336, 0.0001336, 0.0001336, 0.0001336],
-#     'Mg':           [0.0005875, 0.0005875, 0.0005875, 0.0005875, 0.0005875, 0.0005875, 
-#                      0.0005875, 0.0005875, 0.0005875, 0.0005875, 0.0005875, 0.0005875],
-#     'N(3)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'N(5)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Na':           [0.0006748, 0.0006748, 0.0006748, 0.0006748, 0.0006748, 0.0006748, 
-#                      0.0006748, 0.0006748, 0.0006748, 0.0006748, 0.0006748, 0.0006748],
-#     'S(-2)':        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'S(6)':         [5.516E-05, 5.516E-05, 5.516E-05, 5.516E-05, 5.516E-05, 5.516E-05,
-#                      5.516E-05, 5.516E-05, 5.516E-05, 5.516E-05, 5.516E-05, 5.516E-05],
-#     'Si':           [0.0003497, 0.0003497, 0.0003497, 0.0003497, 0.0003497, 0.0003497, 
-#                      0.0003497, 0.0003497, 0.0003497, 0.0003497, 0.0003497, 0.0003497],
-#     'Amm':          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'N(0)':         [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Tmp':          [0.017, 0.017, 0.017, 0.017, 0.017, 0.017, 
-#                      0.017, 0.017, 0.017, 0.017, 0.017, 0.017],
-#     'pH':           [6.601, 6.601, 6.601, 6.601, 6.601, 6.601, 
-#                      6.601, 6.601, 6.601, 6.601, 6.601, 6.681],
-#     'pe':           [-2.449, -2.449, -2.449, -2.449, -2.449, -2.449, 
-#                      -2.449, -2.449, -2.449, -2.449, -2.449, -2.449],
-#     'Ferrihydrite': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 
-#                      0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-#     'Orgmatter':    [2.410781, 0.3873438, 1.445313, 0.1907813, 0.1907813, 0.1907813,
-#                      1.925156, 1.925156, 1.925156, 1.925156, 1.925156, 1.925156],
-#     'Ca_ex':        [0.1188, 0.02138, 0.07358, 0.01891, 0.01891, 0.01891,
-#                      0.05919, 0.05919, 0.05919, 0.05919, 0.05919, 0.05919],
-#     'Fe_ex':        [0.002451, 0.0004411, 0.001518, 0.0003902, 0.0003902, 0.0003902,
-#                      0.001221, 0.001221, 0.001221, 0.001221, 0.001221, 0.001221],
-#     'K_ex':         [0.00157, 0.0002825, 0.0009723, 0.0002499, 0.0002499, 0.0002499, 
-#                      0.0007822, 0.0007822, 0.0007822, 0.0007822, 0.0007822, 0.0007822],
-#     'Mg_ex':        [0.02131, 0.003835, 0.0132, 0.003393, 0.003393, 0.003393, 
-#                      0.01062, 0.01062, 0.01062, 0.01062, 0.01062, 0.01062],
-#     'Na_ex':        [0.001596, 0.0002872, 0.0009888, 0.0002541, 0.0002541, 0.0002541,
-#                      0.0007954, 0.0007954, 0.0007954, 0.0007954, 0.0007954, 0.0007954],
-#     'Pyrite':       [0.0629, 0.0222, 0.0999, 0.01295, 0.01295, 0.01295, 
-#                      0.13135, 0.13135, 0.13135, 0.13135, 0.13135, 0.13135]
-    
-# }
-
-# # define icbund arrays for each layer for the transport model from the previous pht3d model
-# layer_txt_files = ['layer_1.txt', 'layer_2.txt', 'layer_3.txt', 'layer_4.txt', 
-#                    'layer_5.txt', 'layer_6.txt', 'layer_7.txt', 'layer_8.txt', 
-#                    'layer_9.txt', 'layer_10.txt', 'layer_11.txt', 'layer_12.txt']
-
-# transport_ws = os.path.join(os.getcwd(), 'transport')
-
-# pht3d_icbund = np.zeros((nlay, nrow, ncol))
-# for i, layer_txt_files in enumerate(layer_txt_files):
-#     pht3d_icbund[i] = reformat_arrays(os.path.join(transport_ws, 'props', 'icbund', layer_txt_files), 
-#                                 os.path.join(transport_ws, 'props', 'icbund', 'format_'+str(layer_txt_files)), 
-#                                 nrow, 
-#                                 ncol)
-    
-# # define parameters for source-sink-mixing (SSM) package defined from SSM package file
-# # specify six booleans in line 1 for types
-# FWEL = 'T' # fwel flag is true
-# FDRN = 'F' # fdrn flag is false
-# FRCH = 'F' # frch flag is false
-# FEVT = 'F' # fevt flag is false
-# FRIV = 'F' # friv flag is false
-# FGHB = 'F' # fghb flag is false
-
-# ssm_line_1 = pd.DataFrame([[str(FWEL), str(FDRN), str(FRCH), str(FEVT), str(FRIV), str(FGHB)]])
-# ssm_line_1.columns = [0, 1, 2, 3, 4, 5]  # Assuming the first column is the index column
-
-# # define ssm line 2
-# MXSS = 2245 # maximum number of source-sinks defined from SSM package file
-# ssm_line_2 = pd.DataFrame([[MXSS]], columns=[0])
-
-# # define all of the source-sink terms for the well boundary conditions with chemistry for all 29 constituents
-# # lay, row, col, CSS (0=dummy value per manual), type (2=well), 
-# # Orgc, O(0), C(4), C(-4), Ca, 
-# # Cl, Fe(2), Fe(3), K, Mg, 
-# # N(3), N(5), Na, S(-2), S(6), 
-# # Si, Amm, N(0), Tmp, pH, 
-# # pe, Ferrihydrite, Orgmatter, Ca_ex, Fe_ex, 
-# # K_ex, Mg_ex, Na_ex, Pyrite
-
-# # load in csv of ssm entries
-# ssm_entry_rows = pd.read_csv(os.path.join(os.getcwd(), 'transport', 'ssm', 'ssm_entries.csv'), index_col=False)
-# # Remove column headers from the CSV data
-# ssm_entry_rows.columns = range(ssm_entry_rows.shape[1])  # Reset column names to default integer-based names
-
-# # combine all entries to make ssm package dataframe
-
-# ssm_combined = pd.concat([ssm_line_1, ssm_line_2, ssm_entry_rows], ignore_index=True, axis=0)
-
-# # Check the first 5 columns for numeric values and round them to nearest integer for lay row col css type
-# # We only modify the first 5 columns (0, 1, 2, 3, 4)
-# for col in range(5):  # Loop through the first 5 columns
-#     # Convert values to numeric, keeping 'T' and 'F' booleans intact
-#     ssm_combined.iloc[1:, col] = pd.to_numeric(ssm_combined.iloc[1:, col], errors='coerce')
-
-#     # Round numeric values to nearest whole number (integer), but leave 'T' and 'F' unaffected
-#     ssm_combined.iloc[1:, col] = ssm_combined.iloc[1:, col].round()
-
-# # print combined ssm 
-# print(ssm_combined)
-# # Now let's write the DataFrame to a text file while skipping NaN values
-# file_path = os.path.join(os.getcwd(), 'transport', 'ssm', 'ssm_pkg_test.txt')  # Specify your file path
-# # Convert DataFrame to string (without NaN values)
-# ssm_combined_cleaned = ssm_combined.fillna('')  # Replace NaN with empty string if needed
-# output_str = ssm_combined_cleaned.to_string(index=False, header=False)
-
-# # Write the string to a text file
-# with open(file_path, 'w') as file:
-#     file.write(output_str)
-
-# # import phinp.dat from pht3d model using phreeqc rm
-# nxyz = nlay * ncol * nrow
-# nthreads = 3
-
-# phreeqc_rm = phreeqcrm.PhreeqcRM(nxyz, nthreads)
-
-# database_fpth = os.path.join(os.getcwd(), 'transport', 'database', 'dizon.pht3d_database')
-
-# # Load the database
-# phreeqc_rm.LoadDatabase(database_fpth)
-
-# pqi_fpth = os.path.join(os.getcwd(), 'transport', 'pqi', 'phinp.dat')
-
-# # Run the input file
-# phreeqc_rm.RunFile(True, True, True, pqi_fpth)
 
 def main():
-    ws = prep_model_dir()
+    ws = prep_model_dir(name='Tmp')
     nlay = 12
     nrow = 10
     ncol = 51
     mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    tracer = None
-
+    tracer = 'Tmp'
+    # print(mup3d_m.components)
+    # print(mup3d_m.sconc['Tmp'])
     sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
     sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
     # run_model(sim)
-    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+    pyemu.os_utils.run('mf6', cwd=sim.sim_path)
 if __name__ == "__main__":
     main()
