@@ -1,8 +1,8 @@
-name: benchmarks_rtm
+name: dizon36
 channels:
   - conda-forge
 dependencies:
-  - python=3.10
+  - python=3.12
   - pip
   - pandas>=2.0
   - numpy>=1.25 
@@ -16,10 +16,10 @@ dependencies:
   - scikit-learn
   - shapely
   - pip:
-      - -e ./dependencies/mf6rtm
-      - -e ./dependencies/flopy
-      # - -e ./dependencies/pyemu
-      # - -e ./dependencies/pypestutils
+      - mf6rtm
+      - flopy
+      - pyemu
+      - pypestutils
 
 
 

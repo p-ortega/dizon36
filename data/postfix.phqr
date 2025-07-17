@@ -1,0 +1,24 @@
+SELECTED_OUTPUT
+    -reset         false
+    -distance         false
+    -file          out.dat
+
+USER_PUNCH
+    -headings time_d cell TOT_Orgc TOT_O0 TOT_C4 TOT_C_4 TOT_Ca TOT_Cl TOT_Fe2 TOT_Fe3 TOT_K TOT_Mg \
+              TOT_N3 TOT_N5 TOT_Na TOT_S_2 TOT_S6 TOT_Si TOT_Amm TOT_N0 TOT_Tmp \
+              LA_H LA_e \
+              EQUI_Ferrihydrite EQUI_Orgmatter \
+              MOL_CaX2 MOL_FeX2 MOL_KX MOL_MgX2 MOL_NaX \
+              KIN_Pyrite
+    -start
+    10 PUNCH TOTAL_TIME/86400
+    11 PUNCH cell_no
+    12 PUNCH TOT("Orgc")
+    20 PUNCH TOT("O(0)"), TOT("C(4)"), TOT("C(-4)"), TOT("Ca"), TOT("Cl"), TOT("Fe(2)"), TOT("Fe(3)"), TOT("K"), TOT("Mg")
+    21 PUNCH TOT("N(3)"), TOT("N(5)"), TOT("Na"), TOT("S(-2)"), TOT("S(6)"), TOT("Si"), TOT("Amm"), TOT("N(0)"), TOT("Tmp")
+    30 PUNCH -LA("H+"), -LA("e-")
+    60 PUNCH EQUI("Ferrihydrite"), EQUI("Orgmatter")
+    70 PUNCH MOL("CaX2"), MOL("FeX2"), MOL("KX"), MOL("MgX2"), MOL("NaX")
+    90 PUNCH KIN("Pyrite")
+    -end
+END
