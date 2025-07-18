@@ -16,6 +16,34 @@ datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
 props_ws = os.path.join(datadir, 'props')
 
+nper = 39  # Number of stress periods
+
+perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
+            (7, 7, 1), (7, 7, 1), (7, 7, 1), (14, 14, 1), (14, 14, 1), 
+            (15, 15, 1), (13, 13, 1), (14, 14, 1), (14, 14, 1), (14, 14, 1), 
+            (21, 21, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
+
+def create_output_pairs(perioddata, output_interval=5):
+    pairs = []
+    cumulative_day = 0
+    next_output_day = 0
+    
+    for kper, (perlen, nstp, tsmult) in enumerate(perioddata):
+        period_days = int(perlen)
+        
+        # Check each day in this stress period
+        for day_in_period in range(period_days):
+            if cumulative_day == next_output_day:
+                pairs.append((kper+1, day_in_period+1))
+                next_output_day += output_interval
+            
+            cumulative_day += 1
+    
+    return pairs
 
 def append_values_to_inner_lists(d, values, *, in_place=False):
     """
@@ -304,6 +332,9 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.set_phases(kinetics)
     model.set_phases(equilibriums)
 
+    tsteps = create_output_pairs(perioddata, output_interval=5)
+    model.set_config(reaction_timing='user', 
+                        tsteps=tsteps)
     model.initialize()
 
     return model
@@ -480,10 +511,13 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
     # specify tdis
     tdis = flopy.mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", 
                                  nper=nper, perioddata=perioddata)
-
+    outer_dvclose = 1e-7
+    inner_dvclose = 1e-7
     ims = flopy.mf6.ModflowIms(sim, 
                             #    pname="ims", 
-                            complexity="COMPLEX",
+                            complexity="complex",
+                            outer_dvclose=outer_dvclose,
+                            inner_dvclose=inner_dvclose,
                             filename=f"{model_name}.ims")
     sim.register_ims_package(ims, 
                              [model_name])
@@ -582,7 +616,7 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
     nlay = gwf.dis.nlay.get_data()
 
     ne = 0.35 # effective porosity (-) constant across all layers
-    long_disp = 0.01 # Longitudinal dispersivity (m)constant across all layers
+    long_disp = 0.1 # Longitudinal dispersivity (m)constant across all layers
     disp_tr_vert = long_disp*0.01 # Transverse vertical dispersivity (m) constant across all layers
     disp_tr_hor = long_disp*0.1 # Transverse horizontal dispersivity (m) constant across all layers
     diffc = 0 # diffusion coefficient constant across all layers
@@ -601,12 +635,15 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             modelname=model_name,
             model_nam_file=f"{model_name}.nam"
         )
-
-        imsgwt = flopy.mf6.ModflowIms(sim, 
-                                    #   pname="ims", 
-                                complexity="COMPLEX",
+        outer_dvclose = 1e-7
+        inner_dvclose = 1e-7
+        ims = flopy.mf6.ModflowIms(sim, 
+                                #    pname="ims", 
+                                complexity="complex",
+                                outer_dvclose=outer_dvclose,
+                                inner_dvclose=inner_dvclose,
                                 filename=f"{model_name}.ims")
-        sim.register_ims_package(imsgwt, 
+        sim.register_ims_package(ims, 
                                 [model_name])
 
         dis = gwf.dis
@@ -721,17 +758,17 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
     return sim
 
 def main():
-    ws = prep_model_dir(name='Tmp')
+    ws = prep_model_dir(name='test')
     nlay = 12
     nrow = 10
     ncol = 51
     mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    tracer = 'Tmp'
+    tracer = None
     # print(mup3d_m.components)
     # print(mup3d_m.sconc['Tmp'])
     sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
     sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
     # run_model(sim)
-    pyemu.os_utils.run('mf6', cwd=sim.sim_path)
+    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
 if __name__ == "__main__":
     main()
