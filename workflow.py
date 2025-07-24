@@ -336,8 +336,8 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     # model.set_charge_offset(1e-3)
     tsteps = create_output_pairs(perioddata, output_interval=2)
     model.set_config(
-                    reaction_timing='user', 
-                    tsteps=tsteps
+                    reaction_timing='all', 
+                    # tsteps=tsteps
                     )
     model.set_componenth2o(True)
     model.initialize(add_charge_flag=True)
