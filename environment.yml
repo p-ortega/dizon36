@@ -16,7 +16,7 @@ dependencies:
   - scikit-learn
   - shapely
   - pip:
-      - mf6rtm
+      - mf6rtm>=0.1.10
       - flopy
       - pyemu
       - pypestutils
