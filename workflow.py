@@ -16,6 +16,34 @@ datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
 props_ws = os.path.join(datadir, 'props')
 
+nper = 39  # Number of stress periods
+
+perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
+            (7, 7, 1), (7, 7, 1), (7, 7, 1), (14, 14, 1), (14, 14, 1), 
+            (15, 15, 1), (13, 13, 1), (14, 14, 1), (14, 14, 1), (14, 14, 1), 
+            (21, 21, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+            (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
+
+def create_output_pairs(perioddata, output_interval=5):
+    pairs = []
+    cumulative_day = 0
+    next_output_day = 0
+    
+    for kper, (perlen, nstp, tsmult) in enumerate(perioddata):
+        period_days = int(perlen)
+        
+        # Check each day in this stress period
+        for day_in_period in range(period_days):
+            if cumulative_day == next_output_day:
+                pairs.append((kper+1, day_in_period+1))
+                next_output_day += output_interval
+            
+            cumulative_day += 1
+    
+    return pairs
 
 def append_values_to_inner_lists(d, values, *, in_place=False):
     """
@@ -55,7 +83,6 @@ def append_values_to_inner_lists(d, values, *, in_place=False):
                 inner.extend(values)   # add every element in order
             else:
                 inner.append(values)   # add the single value
-
     return target
 
 def run_model(sim):
@@ -237,8 +264,9 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     # the next array has a length of nlay, one for each layer
     eq_solutions = [1] * nlay
     exchanger.set_equilibrate_solutions(eq_solutions)
-
+    
     mindf = pd.read_csv(os.path.join(os.path.join(datadir,"ic_surfaces.csv")), comment = '#')
+    mindf['value'] = [utils.concentration_volbulk_to_volwater(i,0.35) for i in mindf['value'].values]
     mindf = mindf.pivot(index="var", columns="layer", values="value")
     
     # only ferrihydrite and orgmatter are in eq
@@ -278,11 +306,13 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
         # print(ly+1)
         for key in py_m0.keys():
             kin_dic[ly+1] = {key: [py_m0[key][ly], kin_py_params]}
+            # kin_dic[ly+1]  = {key: [3.752857e-01 , kin_py_params]}
+            # 3.752857e-01 
     kin_dic
 
     # lets add orgc now with a m0 of zero for all layers
     for key in kin_dic.keys():
-        kin_dic[key]['Orgc'] = [0.0, kin_orgc_params, orgc_form, orgc_steps]
+        kin_dic[key]['Orgc'] = [1.0, kin_orgc_params, orgc_form, orgc_steps]
     kin_dic
     kinetics = mup3d.KineticPhases(kin_dic)
     kinetics.set_ic(exchanger_ic)
@@ -303,9 +333,14 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.set_exchange_phases(exchanger)
     model.set_phases(kinetics)
     model.set_phases(equilibriums)
-
-    model.initialize()
-
+    # model.set_charge_offset(1e-3)
+    tsteps = create_output_pairs(perioddata, output_interval=2)
+    model.set_config(
+                    reaction_timing='user', 
+                    tsteps=tsteps
+                    )
+    model.set_componenth2o(True)
+    model.initialize(add_charge_flag=True)
     return model
 
 def make_wel_in(gwf, one_compound = None, mup3d_m=None, nper=39):
@@ -480,10 +515,13 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
     # specify tdis
     tdis = flopy.mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", 
                                  nper=nper, perioddata=perioddata)
-
+    outer_dvclose = 1e-7
+    inner_dvclose = 1e-7
     ims = flopy.mf6.ModflowIms(sim, 
                             #    pname="ims", 
-                            complexity="COMPLEX",
+                            complexity="complex",
+                            outer_dvclose=outer_dvclose,
+                            inner_dvclose=inner_dvclose,
                             filename=f"{model_name}.ims")
     sim.register_ims_package(ims, 
                              [model_name])
@@ -582,7 +620,7 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
     nlay = gwf.dis.nlay.get_data()
 
     ne = 0.35 # effective porosity (-) constant across all layers
-    long_disp = 0.01 # Longitudinal dispersivity (m)constant across all layers
+    long_disp = 0.1 # Longitudinal dispersivity (m)constant across all layers
     disp_tr_vert = long_disp*0.01 # Transverse vertical dispersivity (m) constant across all layers
     disp_tr_hor = long_disp*0.1 # Transverse horizontal dispersivity (m) constant across all layers
     diffc = 0 # diffusion coefficient constant across all layers
@@ -594,6 +632,7 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         components = [tracer]
 
     for comp in components:
+        print(f"Setting transport for {comp}")
         model_name = comp
         gwt = flopy.mf6.MFModel(
             sim,
@@ -601,12 +640,15 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             modelname=model_name,
             model_nam_file=f"{model_name}.nam"
         )
-
-        imsgwt = flopy.mf6.ModflowIms(sim, 
-                                    #   pname="ims", 
-                                complexity="COMPLEX",
+        outer_dvclose = 1e-7
+        inner_dvclose = 1e-7
+        ims = flopy.mf6.ModflowIms(sim, 
+                                #    pname="ims", 
+                                complexity="complex",
+                                outer_dvclose=outer_dvclose,
+                                inner_dvclose=inner_dvclose,
                                 filename=f"{model_name}.ims")
-        sim.register_ims_package(imsgwt, 
+        sim.register_ims_package(ims, 
                                 [model_name])
 
         dis = gwf.dis
@@ -679,18 +721,32 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             distcoef = np.ones(shape=(nlay,ncol, nrow))*2.1141E-04
             sorption = "Linear"
             pbulk = 1850
+            bulk_density = np.ones(shape=(nlay,ncol, nrow))*pbulk
+            ne=0.35
+        # if comp=='O' or comp=='H' or comp=="Charge":
+        #     # kd = 2*ne/1850
+        #     distcoef = np.ones(shape=(nlay,ncol, nrow))*1e-3
+        #     sorption = "Linear"
+        #     # distcoef = None
+        #     # sorption = None
+        #     pbulk = 1850
+        #     bulk_density = np.ones(shape=(nlay,ncol, nrow))*pbulk
+        #     ne=1
         else:
             distcoef = None
             sorption = None
-            pbulk = None
+            bulk_density = None
+            ne=0.35
+        porosity  = np.ones(shape=(nlay,ncol, nrow))*ne
+        
         mst = flopy.mf6.ModflowGwtmst(
             gwt,
-            porosity=ne,
+            porosity=porosity,
             first_order_decay=None,
             decay = None,
             decay_sorbed=None,
             sorption= sorption,
-            bulk_density=pbulk, 
+            bulk_density=bulk_density, 
             distcoef=distcoef, #Kd m3/mg
             sp2 = None,
             filename=f"{model_name}.mst",
@@ -715,23 +771,22 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             filename=f"{model_name}.gwfgwt",
         )
         make_obs_pack(gwt)
-    
-    
+
     sim.write_simulation() 
     return sim
 
 def main():
-    ws = prep_model_dir(name='Tmp')
+    ws = prep_model_dir(name='reactive')
     nlay = 12
     nrow = 10
     ncol = 51
     mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    tracer = 'Tmp'
+    tracer = None
     # print(mup3d_m.components)
     # print(mup3d_m.sconc['Tmp'])
     sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
     sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
     # run_model(sim)
-    pyemu.os_utils.run('mf6', cwd=sim.sim_path)
+    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
 if __name__ == "__main__":
     main()
