@@ -83,7 +83,6 @@ def append_values_to_inner_lists(d, values, *, in_place=False):
                 inner.extend(values)   # add every element in order
             else:
                 inner.append(values)   # add the single value
-
     return target
 
 def run_model(sim):
@@ -265,8 +264,9 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     # the next array has a length of nlay, one for each layer
     eq_solutions = [1] * nlay
     exchanger.set_equilibrate_solutions(eq_solutions)
-
+    
     mindf = pd.read_csv(os.path.join(os.path.join(datadir,"ic_surfaces.csv")), comment = '#')
+    mindf['value'] = [utils.concentration_volbulk_to_volwater(i,0.35) for i in mindf['value'].values]
     mindf = mindf.pivot(index="var", columns="layer", values="value")
     
     # only ferrihydrite and orgmatter are in eq
@@ -306,11 +306,13 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
         # print(ly+1)
         for key in py_m0.keys():
             kin_dic[ly+1] = {key: [py_m0[key][ly], kin_py_params]}
+            # kin_dic[ly+1]  = {key: [3.752857e-01 , kin_py_params]}
+            # 3.752857e-01 
     kin_dic
 
     # lets add orgc now with a m0 of zero for all layers
     for key in kin_dic.keys():
-        kin_dic[key]['Orgc'] = [0.0, kin_orgc_params, orgc_form, orgc_steps]
+        kin_dic[key]['Orgc'] = [1.0, kin_orgc_params, orgc_form, orgc_steps]
     kin_dic
     kinetics = mup3d.KineticPhases(kin_dic)
     kinetics.set_ic(exchanger_ic)
@@ -331,12 +333,14 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.set_exchange_phases(exchanger)
     model.set_phases(kinetics)
     model.set_phases(equilibriums)
-
-    tsteps = create_output_pairs(perioddata, output_interval=5)
-    model.set_config(reaction_timing='user', 
-                        tsteps=tsteps)
-    model.initialize()
-
+    # model.set_charge_offset(1e-3)
+    tsteps = create_output_pairs(perioddata, output_interval=2)
+    model.set_config(
+                    reaction_timing='user', 
+                    tsteps=tsteps
+                    )
+    model.set_componenth2o(True)
+    model.initialize(add_charge_flag=True)
     return model
 
 def make_wel_in(gwf, one_compound = None, mup3d_m=None, nper=39):
@@ -628,6 +632,7 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         components = [tracer]
 
     for comp in components:
+        print(f"Setting transport for {comp}")
         model_name = comp
         gwt = flopy.mf6.MFModel(
             sim,
@@ -716,18 +721,32 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             distcoef = np.ones(shape=(nlay,ncol, nrow))*2.1141E-04
             sorption = "Linear"
             pbulk = 1850
+            bulk_density = np.ones(shape=(nlay,ncol, nrow))*pbulk
+            ne=0.35
+        # if comp=='O' or comp=='H' or comp=="Charge":
+        #     # kd = 2*ne/1850
+        #     distcoef = np.ones(shape=(nlay,ncol, nrow))*1e-3
+        #     sorption = "Linear"
+        #     # distcoef = None
+        #     # sorption = None
+        #     pbulk = 1850
+        #     bulk_density = np.ones(shape=(nlay,ncol, nrow))*pbulk
+        #     ne=1
         else:
             distcoef = None
             sorption = None
-            pbulk = None
+            bulk_density = None
+            ne=0.35
+        porosity  = np.ones(shape=(nlay,ncol, nrow))*ne
+        
         mst = flopy.mf6.ModflowGwtmst(
             gwt,
-            porosity=ne,
+            porosity=porosity,
             first_order_decay=None,
             decay = None,
             decay_sorbed=None,
             sorption= sorption,
-            bulk_density=pbulk, 
+            bulk_density=bulk_density, 
             distcoef=distcoef, #Kd m3/mg
             sp2 = None,
             filename=f"{model_name}.mst",
@@ -752,13 +771,12 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             filename=f"{model_name}.gwfgwt",
         )
         make_obs_pack(gwt)
-    
-    
+
     sim.write_simulation() 
     return sim
 
 def main():
-    ws = prep_model_dir(name='test')
+    ws = prep_model_dir(name='reactive')
     nlay = 12
     nrow = 10
     ncol = 51
