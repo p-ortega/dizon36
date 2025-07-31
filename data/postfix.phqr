@@ -4,9 +4,9 @@ SELECTED_OUTPUT
     -file          out.dat
 
 USER_PUNCH
-    -headings time_d cell TOT_Orgc TOT_O0 TOT_C4 TOT_C_4 TOT_Ca TOT_Cl TOT_Fe2 TOT_Fe3 TOT_K TOT_Mg \
-              TOT_N3 TOT_N5 TOT_Na TOT_S_2 TOT_S6 TOT_Si TOT_Amm TOT_N0 TOT_Tmp \
-              LA_H LA_e \
+    -headings time cell Orgc O0 tic C_4 Ca Cl Fe2 Fe3 K Mg \
+              N3 NO3 Na S_2 SO4 Si Amm N0 Tmp \
+              pH pe \
               EQUI_Ferrihydrite EQUI_Orgmatter \
               MOL_CaX2 MOL_FeX2 MOL_KX MOL_MgX2 MOL_NaX \
               KIN_Pyrite
