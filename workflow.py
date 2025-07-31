@@ -247,12 +247,15 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
                 }
     # we need to rename to match the database
     excdf['name'] = excdf['var'].map(ex_names)
+    excdf['layer'] -= 1  # convert to zero‑indexed
     excdf = excdf.pivot(index="name", columns="layer", values="value")
+    exchanger_dict = excdf.to_dict()
+    for k, subdict in exchanger_dict.items():
+        for key in subdict:
+            subdict[key] = {'m0': subdict[key]}
 
-    exchangerdic = utils.solution_df_to_dict(excdf)
-    exchanger = mup3d.ExchangePhases(exchangerdic)
+    exchanger = mup3d.ExchangePhases(exchanger_dict)
 
-    # exchanger_ic = np.ones((nlay, nrow, ncol), dtype=float)
     layer_vals = np.arange(1, nlay + 1, dtype=float)   # shape (nlay,)
 
     # Broadcast to full 3‑D grid
@@ -279,9 +282,14 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     eq_dic = {}
     #lets add pyrite first
     for ly in range(nlay):
+        for key in eq_m0.keys():
+            # create a dictionary for each layer with key as the mineral name
+            # and values as a dictionary with si and m0
         # si followed by m0 (init moles)
-        eq_dic[ly+1] = {key: [si, eq_m0[key][ly]] for key in eq_m0.keys()}
-    eq_dic
+            eq_dic[ly] = {key: {}}
+            eq_dic[ly][key]['si'] = si
+            eq_dic[ly][key]['m0'] = eq_m0[key][ly]
+            # eq_dic[ly+1] = {key: [si, eq_m0[key][ly]] for key in eq_m0.keys()}
     equilibriums = mup3d.EquilibriumPhases(eq_dic)
     equilibriums.set_ic(exchanger_ic)
 
@@ -305,27 +313,30 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     for ly in range(nlay):
         # print(ly+1)
         for key in py_m0.keys():
-            kin_dic[ly+1] = {key: [py_m0[key][ly], kin_py_params]}
-            # kin_dic[ly+1]  = {key: [3.752857e-01 , kin_py_params]}
-            # 3.752857e-01 
-    kin_dic
+            kin_dic[ly] = {key: {}}
+            kin_dic[ly][key]['m0'] = py_m0[key][ly]
+            kin_dic[ly][key]['parms'] = kin_py_params
+            # kin_dic[ly+1] = {key: [py_m0[key][ly], kin_py_params]}
 
     # lets add orgc now with a m0 of zero for all layers
     for key in kin_dic.keys():
-        kin_dic[key]['Orgc'] = [1.0, kin_orgc_params, orgc_form, orgc_steps]
-    kin_dic
+        kin_dic[key]['Orgc'] = {}
+        kin_dic[key]['Orgc']['m0'] = 1.0
+        kin_dic[key]['Orgc']['parms'] = kin_orgc_params
+        kin_dic[key]['Orgc']['formula'] = orgc_form
+        kin_dic[key]['Orgc']['steps'] = orgc_steps
+        # [1.0, kin_orgc_params, orgc_form, orgc_steps]
     kinetics = mup3d.KineticPhases(kin_dic)
     kinetics.set_ic(exchanger_ic)
-    kinetics.data
-
     model = mup3d.Mup3d('dizon36',solution, nlay, nrow, ncol)
-
 
     # #set model workspace
     model.set_wd(ws)
 
     # set database
-    database = os.path.join(datadir, f'datab.dat')
+    # shutil copy datab
+    shutil.copy(os.path.join(datadir, f'datab.dat'), os.path.join(model.wd, f'datab.dat'))
+    database = os.path.join(model.wd, f'datab.dat')
     model.set_database(database)
 
     postfix = os.path.join(datadir, f'postfix.phqr')
@@ -775,18 +786,184 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
     sim.write_simulation() 
     return sim
 
+def clean_array_files(ws, files, gwf):
+    nrows, ncols = gwf.dis.nrow.get_data(), gwf.dis.ncol.get_data()
+    for file in files:
+        with open(os.path.join(ws,file),'r') as f:
+            lines = []
+            for l in f.readlines():
+                lines.extend([float(i) for i in l.split()])
+        array = np.array(lines).reshape(nrows,ncols)
+        np.savetxt(os.path.join(ws,file),array,fmt='%.6e')
+    return
+
+# def get_lst_budget(ws='.',start_datetime=None):
+#     import flopy
+#     lst = flopy.utils.Mf6ListBudget(os.path.join(ws,"pl253.lst"))
+#     inc,cum = lst.get_dataframes(diff=True,start_datetime=start_datetime)
+#     inc.columns = inc.columns.map(lambda x: x.lower().replace("_","-"))
+#     cum.columns = cum.columns.map(lambda x: x.lower().replace("_", "-"))
+#     inc.index.name = "time"
+#     cum.index.name = "time"
+#     inc.to_csv(os.path.join(ws,"inc.csv"))
+#     cum.to_csv(os.path.join(ws,"cum.csv"))
+#     return inc, cum
+
+def tidy_array_input_files(f, template_ws=os.path.join('pest','pst_template')):
+    """Re-writes array input files as a single column."""
+    filename=os.path.join(template_ws, f)
+    with open(filename, 'r') as ff:
+        a = ff.read()
+    a = [float(i) for i in a.split()]
+    # make a single column
+    a = np.array(a).reshape(-1,1)
+    # record array to txt file in single column
+    np.savetxt(os.path.join(template_ws, f), a, fmt='%.8e')
+    return
+
+def get_input_filenames(tag, template_ws=os.path.join('pest','pst_template')):
+    files = [f for f in os.listdir(template_ws) if tag in f and f.endswith(".txt")] 
+    return files 
+
+def draw_prior_pe(num_reals, pf, template_ws):
+    sigma_range=4.0
+    if pf.pst.npar < 36000:  #if you have more than about 35K pars, the cov matrix becomes hard to handle
+        prior_cov = pf.build_prior(fmt='coo',
+                                   filename=os.path.join(template_ws,"prior_cov.jcb"),
+                                   sigma_range=sigma_range)
+        pf.pst.pestpp_options["parcov"] = "prior_cov.jcb"
+        # draw ensemble
+        pe = pyemu.ParameterEnsemble.from_gaussian_draw(pf.pst, cov=prior_cov, num_reals=num_reals)
+    else:
+        # draw parameters from the prior distribution
+        pe = pf.draw(num_reals=num_reals, use_specsim=False, sigma_range=sigma_range) 
+
+    ### Fix params in boundary TVMs
+    params = list(pe.columns)
+    to_fix = [i for i in params if ('boundary' in i) & ('tvm' in i)]
+    pe.loc[:, to_fix] = 1
+    # enforces parameter bounds
+    pe.enforce() 
+    # save external file
+    pe.to_binary(os.path.join(template_ws,"prior_pe.jcb")) 
+    pf.pst.pestpp_options["ies_parameter_ensemble"] = "prior_pe.jcb"
+    
+    return pe
+
+def setup_pest(org_d, num_reals=50, 
+               template_ws=os.path.join('pest','pst_template'),
+               pstname = 'dizon36'):
+    tmp_d=os.path.join("tmp_d")
+    if os.path.exists(tmp_d):
+        shutil.rmtree(tmp_d)
+    shutil.copytree(org_d,tmp_d)
+
+    sim = flopy.mf6.MFSimulation.load(sim_ws=tmp_d, verbosity_level=0)
+    # load flow model
+    gwf = sim.get_model()
+    # get spatial reference
+    modelgrid = gwf.modelgrid
+    # get zone array
+    ib = gwf.dis.idomain.get_data()
+    ib[ib<1] = 0
+
+    # sr = pyemu.helpers.SpatialReference.from_namfile(
+    #         os.path.join(tmp_d, "gwf.nam"),
+    #         delr=gwf.dis.delr.array, delc=gwf.dis.delc.array)
+
+    pf = pyemu.utils.PstFrom(original_d=tmp_d, 
+                                new_d=template_ws,
+                                remove_existing=True, 
+                                longnames=True, 
+                                spatial_reference=modelgrid, 
+                                zero_based=False, 
+                                # start_datetime=start_datetime, 
+                                echo=False)
+
+    pf.mod_sys_cmds.append("mf6rtm")
+    pf.extra_py_imports.append("flopy")
+
+    pp_v = pyemu.geostats.ExpVario(contribution=1, a=150, anisotropy=2, bearing=0.0)
+    pp_gs = pyemu.geostats.GeoStruct(variograms=pp_v, transform='log')
+
+    tag_list = ["npf_k_", 
+                "npf_k33_",
+                "sto_ss_",
+                "kinetic_phases.Pyrite.m0.",
+                "equilibrium_phases.Orgmatter.m0.",
+                ]
+    lb=0.1
+    ub=10.0
+    for tag in tag_list:
+    # uub=100.0
+    # ulb=0.01
+        files = get_input_filenames(tag, template_ws=template_ws)
+        clean_array_files(template_ws, files, gwf)
+        for f in files:
+            try:
+                # layer = int(f.split(".")[1].split("_layer")[-1]) -1
+                layer = int(f.split(tag)[1].split('.txt')[0].split("layer")[-1]) -1
+            except:
+                layer=0
+            base = tag.replace("_",".")+'layer'+str(layer)
+            print(base)
+            pf.add_parameters(filenames=f,
+                                par_type="pilotpoints",
+                                par_name_base='pp.'+base,
+                                pargp='pp.'+base,
+                                zone_array=ib[layer],
+                                use_pp_zones=True,
+                                upper_bound=ub,
+                                lower_bound=lb,
+                                # ult_ubound=uub,
+                                # ult_lbound=ulb,
+                                pp_options={"pp_space":5,
+                                            "prep_hyperpars":True},
+                                geostruct=pp_gs,
+                                apply_order=2
+                                )
+            pf.add_parameters(f, 
+                                zone_array=ib[layer],
+                                par_type="zone",
+                                geostruct=pp_gs,
+                                par_name_base="cn."+base,
+                                par_style='m',
+                                pargp="cn."+base,
+                                lower_bound=lb,
+                                upper_bound=ub,
+                                # ult_ubound=uub,
+                                # ult_lbound=ulb
+                                )
+            
+            pf.add_observations(f,
+                                prefix=base,
+                                obsgp=base,
+                                zone_array=ib[layer]
+                                )
+        
+    pst = pf.build_pst()
+    pe = draw_prior_pe(num_reals, pf, template_ws)
+    if pf.pst.npar < 35000:
+        pst.pestpp_options["parcov"] = "prior_cov.jcb"
+    pst.pestpp_options["ies_parameter_ensemble"] = "prior_pe.jcb"
+    pst.write(os.path.join(template_ws, f'{pstname}.pst'), version=2)
+
+
 def main():
-    ws = prep_model_dir(name='reactive')
+    # from mf6rtm.externalio import Regenerator
+    ws = prep_model_dir(name='reactive_pest')
     nlay = 12
     nrow = 10
     ncol = 51
     mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
     tracer = None
-    # print(mup3d_m.components)
-    # print(mup3d_m.sconc['Tmp'])
+
     sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
     sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
-    # run_model(sim)
+
     pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+    org_d = os.path.join('model','reactive_pest')
+    setup_pest(org_d, num_reals=50, 
+               template_ws=os.path.join('pest','pst_template'))
 if __name__ == "__main__":
     main()
