@@ -27,6 +27,44 @@ perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
             (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
             (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
 
+def clean_obs_chem(datadir = "data",
+                    input_path="obs_chem_raw.csv", 
+                   output_path="obs_chem_cleaned.csv"):
+    """Load, clean, and save obs_chem data by converting units of specific variables."""
+    input_path = os.path.join(datadir, input_path)
+    output_path = os.path.join(datadir, output_path)
+    obsdata = pd.read_csv(input_path)
+    
+    # Standardize column name
+    obsdata.rename(columns={'var': 'variable'}, inplace=True)
+    
+    # Unit conversions
+    unit_conversions = {
+        'Cl': 1e-3,   # mmol/L → mol/L
+        'Tmp': 1e-3,  # apply scaling to be consistent with outputs
+    }
+
+    for var, factor in unit_conversions.items():
+        obsdata.loc[obsdata['variable'] == var, 'value'] *= factor
+
+    # Save cleaned file
+    obsdata.to_csv(output_path, index=False, float_format="%.5e")
+
+    return obsdata
+
+def time_interpolate(sim_times, sim_vals, obs_times):
+    import numpy as np
+    from scipy import interpolate
+    t0 = min(sim_times)
+    sim_times = [(i-t0).astype(float) for i in sim_times]
+    obs_times = [(i-t0).astype(float) for i in obs_times]
+
+    # Create interpolation function
+    f = interpolate.interp1d(sim_times, sim_vals, fill_value='extrapolate')
+    # Interpolate at new times
+    new_values = f(obs_times)
+    return new_values
+
 def create_output_pairs(perioddata, output_interval=5):
     pairs = []
     cumulative_day = 0
@@ -53,11 +91,11 @@ def append_values_to_inner_lists(d, values, *, in_place=False):
     Parameters
     ----------
     d : dict
-        Your nested‑list dictionary.
+        Your nested list dictionary.
     values : any or Iterable
-        * If `values` is not an Iterable (or is str/bytes), it’s treated as a
+        * If `values` is not an Iterable (or is str/bytes), its treated as a
           single item and appended once.
-        * If `values` is an Iterable (list/tuple/set/range…), each element is
+        * If `values` is an Iterable (list/tuple/set/range), each element is
           appended in order.
     in_place : bool, default False
         True  → modify `d` directly and return it.  
@@ -71,7 +109,6 @@ def append_values_to_inner_lists(d, values, *, in_place=False):
     # Decide whether to work on the original or a shallow copy
     target = d if in_place else {k: [lst[:] for lst in v] for k, v in d.items()}
 
-    # Determine if we have “one thing” or “many things”
     is_iterable = (
         isinstance(values, Iterable) and
         not isinstance(values, (str, bytes))  # treat strings/bytes as scalars
@@ -825,6 +862,12 @@ def get_input_filenames(tag, template_ws=os.path.join('pest','pst_template')):
     files = [f for f in os.listdir(template_ws) if tag in f and f.endswith(".txt")] 
     return files 
 
+def copy_obs_data_files_to_wd(datadir,wd,files=[]):
+    for f in files:
+        assert os.path.isfile(os.path.join(datadir,f)),f"file {f} not found"
+        print(f"Getting {f} from {datadir} to {wd}")
+        shutil.copy(os.path.join(datadir,f), os.path.join(wd, f))
+
 def draw_prior_pe(num_reals, pf, template_ws):
     sigma_range=4.0
     if pf.pst.npar < 36000:  #if you have more than about 35K pars, the cov matrix becomes hard to handle
@@ -847,8 +890,101 @@ def draw_prior_pe(num_reals, pf, template_ws):
     # save external file
     pe.to_binary(os.path.join(template_ws,"prior_pe.jcb")) 
     pf.pst.pestpp_options["ies_parameter_ensemble"] = "prior_pe.jcb"
-    
     return pe
+
+def process_sim_conc(wd='.'):
+    from flopy.utils.gridintersect import GridIntersect
+
+    sim = flopy.mf6.MFSimulation.load(sim_ws = wd,
+                                    sim_name = 'gwf', 
+                                    version='mf6',
+                                        exe_name='mf6',
+                                        verbosity_level=0)
+    gwf = sim.get_model("gwf")
+    sout = pd.read_csv(os.path.join(wd, "sout.csv"))
+
+    # nlay = gwf.dis.nlay.get_data()
+    ncol = gwf.dis.ncol.get_data()
+    nrow = gwf.dis.nrow.get_data()
+
+    ix = GridIntersect(gwf.modelgrid)
+    obsloc = pd.read_csv(os.path.join(wd, "obs_loc.csv"))
+
+    obs_list=[]
+
+    for obsid in obsloc.obsid.unique():
+        x,y = obsloc.loc[obsloc.obsid==obsid,['x','y']].values[0]
+        cellid = ix.intersect([(x,y)],shapetype="point").cellids
+        if len(cellid)==0:
+            continue
+        else:
+            cellid = cellid[0]
+            obs_layer = int(obsloc.loc[obsloc.obsid==obsid,'layer'].values[0])
+            obs_list.append((obsid, 'concentration', (obs_layer, cellid[0], cellid[1])))
+
+    wells = pd.DataFrame(obs_list)
+    wells.columns = ['obsid', 'n', 'cell']
+    wells['flat_index'] = [cell[0] * (nrow * ncol) + cell[1] * ncol + cell[2] for cell in wells.cell]
+
+    obs_to_index = dict(zip(wells['flat_index'], wells['obsid'].str.lower()))
+
+    sout['cell'] = sout['cell'].astype(int)
+    sout['obsid'] = sout['cell'].map(obs_to_index)
+
+    obsdata = pd.read_csv(os.path.join(wd, "obs_chem_cleaned.csv"))
+    obsdata.rename(columns={'var': 'variable'},  inplace=True)
+
+    missvar = set(obsdata['variable'].unique()) - set(sout.columns)
+    obs_ = sout[['time', 'cell']+list(set(obsdata['variable'].unique())  - missvar)].copy()
+    obs_ = obs_.melt(id_vars = ['time', 'cell'])
+    obs_['obsid'] = obs_['cell'].map(obs_to_index)
+    obs_['obsid'].unique()
+
+    obs_in_ = obs_[~obs_['obsid'].isna()].copy()
+    variables = obs_in_.variable.unique()
+    obsids = obs_in_.obsid.unique()
+
+    obsdata = obsdata[obsdata['obsid'].isin(obsids)].copy()
+    obsdata = obsdata[obsdata['variable'].isin(variables)].copy()
+
+    dfmerged = pd.merge(obs_in_[['time','obsid', 'variable', 'value']], obsdata,
+                        on=['time','obsid', 'variable'], how='outer')
+    dfmerged.rename(columns={'value_x':'sim',
+                            'value_y': 'meas'}, inplace=True)
+
+    dfmerged.sort_values(['obsid','time'], inplace=True)
+    dfmerged.set_index('time', inplace=True)
+
+    for oid in obsids:
+        print(f"Processing obs for: {oid:>5}")
+        for var in variables:
+            mask=(dfmerged.obsid==oid)&(dfmerged.variable==var)
+
+            tmp = dfmerged.loc[mask].copy()
+            tmp.dropna(subset=['sim'], inplace=True)
+            if tmp.shape[0]==0:
+                continue
+            obs_times = dfmerged.loc[mask].index.values
+            dfmerged.loc[mask,'sim'] = time_interpolate(tmp.index.values,
+                                                        tmp.sim.values,
+                                                        obs_times)
+
+    fname = '_obs.conc.simvsmeas.csv'
+    dfmerged = dfmerged.reset_index()
+    dfmerged.drop_duplicates(subset=['time', 'obsid', 'variable'], inplace=True)
+    dfmerged = dfmerged.set_index('time')
+    dfmerged.replace(np.nan,1e30).to_csv(os.path.join(wd, fname))
+    print(f"Processed conc saved in {wd}/{fname}")
+
+    # files= []
+    # #lets explode them
+    # for var in dfmerged.variable.unique():
+    #     fname = f'_obs.conc.{var}.csv'
+    #     print(f"Processed conc {var} saved in {wd}/{fname}")
+    #     files.append(fname)
+    #     dfmerged[dfmerged.variable==var].replace(np.nan,1e30).to_csv(os.path.join(wd, fname), 
+    #                                                                  float_format="%.5e")
+    return fname
 
 def setup_pest(org_d, num_reals=50, 
                template_ws=os.path.join('pest','pst_template'),
@@ -882,7 +1018,15 @@ def setup_pest(org_d, num_reals=50,
 
     pf.mod_sys_cmds.append("mf6rtm")
     pf.extra_py_imports.append("flopy")
+    pf.add_py_function("workflow.py","process_sim_conc()",is_pre_cmd=False)
 
+    copy_obs_data_files_to_wd(datadir,template_ws,files=['obs_chem_cleaned.csv', 'obs_loc.csv'])
+    f = process_sim_conc(wd=template_ws)
+    obs_df = pf.add_observations(f, 
+                            insfile=f+".ins", 
+                            index_cols=['time','obsid','variable'], 
+                            use_cols=['sim'], 
+                            prefix=f"conc.") 
     pp_v = pyemu.geostats.ExpVario(contribution=1, a=150, anisotropy=2, bearing=0.0)
     pp_gs = pyemu.geostats.GeoStruct(variograms=pp_v, transform='log')
 
@@ -951,17 +1095,17 @@ def setup_pest(org_d, num_reals=50,
 
 def main():
     # from mf6rtm.externalio import Regenerator
-    ws = prep_model_dir(name='reactive_pest')
-    nlay = 12
-    nrow = 10
-    ncol = 51
-    mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    tracer = None
+    # ws = prep_model_dir(name='reactive_pest')
+    # nlay = 12
+    # nrow = 10
+    # ncol = 51
+    # mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
+    # tracer = None
 
-    sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
-    sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
+    # sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
+    # sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
 
-    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+    # pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     org_d = os.path.join('model','reactive_pest')
     setup_pest(org_d, num_reals=50, 
                template_ws=os.path.join('pest','pst_template'))
