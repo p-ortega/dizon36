@@ -373,7 +373,7 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     # set database
     # shutil copy datab
     shutil.copy(os.path.join(datadir, f'datab.dat'), os.path.join(model.wd, f'datab.dat'))
-    database = os.path.join(model.wd, f'datab.dat')
+    database = os.path.join(f'datab.dat')
     model.set_database(database)
 
     postfix = os.path.join(datadir, f'postfix.phqr')
@@ -986,9 +986,36 @@ def process_sim_conc(wd='.'):
     #                                                                  float_format="%.5e")
     return fname
 
+def build_noise_ensemble(casename="dizon36",
+                         template_ws=os.path.join("pest","pst_template")):
+
+    pst = pyemu.Pst(os.path.join(template_ws,f"{casename}.pst"))
+    obs = pst.observation_data
+
+    # get number of reals 
+    pefname = os.path.join(template_ws, pst.pestpp_options["ies_parameter_ensemble"])
+    pe = pyemu.ParameterEnsemble.from_binary(pst=pst, filename=pefname)
+    num_reals = pe.shape[0]
+
+    # gerenate noise ensemble
+    oe = pyemu.ObservationEnsemble.from_gaussian_draw(pst, num_reals=num_reals)
+
+    oe.iloc[:,:].values[oe.iloc[:,:].values < 0] = 0
+
+    assert oe.columns.isin(obs.obsnme).all()
+
+    #---save ensemble---#
+    fname = os.path.join(template_ws, 'noise.jcb')
+    oe.to_binary(fname)
+    print(f'saving noise ensemble to: {fname}')
+
+    pst.pestpp_options["ies_observation_ensemble"] = 'noise.jcb'
+    pst.write(os.path.join(template_ws, f"{casename}.pst"), version=2)
+    return oe
+
 def setup_pest(org_d, num_reals=50, 
                template_ws=os.path.join('pest','pst_template'),
-               pstname = 'dizon36'):
+               casename = 'dizon36'):
     tmp_d=os.path.join("tmp_d")
     if os.path.exists(tmp_d):
         shutil.rmtree(tmp_d)
@@ -1019,6 +1046,7 @@ def setup_pest(org_d, num_reals=50,
     pf.mod_sys_cmds.append("mf6rtm")
     pf.extra_py_imports.append("flopy")
     pf.add_py_function("workflow.py","process_sim_conc()",is_pre_cmd=False)
+    pf.add_py_function("workflow.py","time_interpolate()",is_pre_cmd=None)
 
     copy_obs_data_files_to_wd(datadir,template_ws,files=['obs_chem_cleaned.csv', 'obs_loc.csv'])
     f = process_sim_conc(wd=template_ws)
@@ -1026,7 +1054,7 @@ def setup_pest(org_d, num_reals=50,
                             insfile=f+".ins", 
                             index_cols=['time','obsid','variable'], 
                             use_cols=['sim'], 
-                            prefix=f"conc.") 
+                            prefix=f"hm") 
     pp_v = pyemu.geostats.ExpVario(contribution=1, a=150, anisotropy=2, bearing=0.0)
     pp_gs = pyemu.geostats.GeoStruct(variograms=pp_v, transform='log')
 
@@ -1090,12 +1118,78 @@ def setup_pest(org_d, num_reals=50,
     if pf.pst.npar < 35000:
         pst.pestpp_options["parcov"] = "prior_cov.jcb"
     pst.pestpp_options["ies_parameter_ensemble"] = "prior_pe.jcb"
-    pst.write(os.path.join(template_ws, f'{pstname}.pst'), version=2)
+    pst.write(os.path.join(template_ws, f'{casename}.pst'), version=2)
 
+
+def run_pestpp(md=f"master", td="pst_template", casename="isr", 
+               noptmax=-1,freeze=False,
+               num_workers=10, worker_root=".", 
+               pestpp_version="ies",restart=False,
+               reuse_master=False, cleanup=True):
+
+    pst = pyemu.Pst(os.path.join(td, f"{casename}.pst"))
+    pst.control_data.noptmax = noptmax
+
+    # and a options to reduce the number of lost reals and improve conditioning
+    pst.pestpp_options["overdue_giveup_fac"] = 1e30
+    pst.pestpp_options["overdue_giveup_minutes"] = 1e30
+    pst.pestpp_options["ies_no_noise"] = False 
+    pst.pestpp_options["ies_subset_size"] = -10 # the more the merrier
+    pst.pestpp_options["ies_bad_phi_sigma"] = 2.0
+    pst.pestpp_options["panther_agent_freeze_on_fail"] = freeze
+
+    pst.write(os.path.join(td, f"{casename}.pst"), version=2)
+    # run
+    pyemu.os_utils.start_workers(td,
+                                 f'pestpp-{pestpp_version}',  # the PEST software version we want to run
+                                 f'{casename}.pst',  # the control file to use with PEST
+                                 num_workers=num_workers,  # how many agents to deploy
+                                 worker_root=worker_root,
+                                 # where to deploy the agent directories; relative to where python is running
+                                 master_dir=md,
+                                 reuse_master=reuse_master,
+                                 )
+    return
+
+def set_obsval_and_weights(casename="dizon36",
+                           template_ws=os.path.join("pest","pst_template")):
+    
+    '''Set observation parval1 and weights for history matching in pst
+    '''
+    pst = pyemu.Pst(os.path.join(template_ws,f"{casename}.pst"))
+
+    obs = pst.observation_data
+    obs.weight = 0.0
+
+    hm_obs = obs.oname == 'hm'
+    zero_weight_obs = obs.loc[obs.obsval>=1e30].obsnme
+    zero_weight_obs
+
+    obs_hm = obs.loc[hm_obs].copy()
+    obs_hm.sort_values(['obsid','time'], inplace=True)
+    obs_hm['time'] = obs_hm['time'].astype(float)
+
+    obs_chem = pd.read_csv(os.path.join(template_ws, "_obs.conc.simvsmeas.csv"))
+    obs_chem.sort_values(['obsid','time'], inplace=True)
+    obs_chem['variable'] = obs_chem['variable'].str.lower()
+
+    assert obs_hm.shape[0] == obs_chem.shape[0]
+
+    obs_chem = pd.merge(obs_hm, obs_chem, on=['time','obsid', 'variable'])
+    obs_chem.loc[obs_chem.meas<1e30, 'weight'] = 1.0
+    obs_chem['oname'] = obs_chem['variable']
+    obs.loc[obs_chem.obsnme, 'obsval'] = obs_chem.meas.values
+    obs.loc[obs_chem.obsnme, 'weight'] = obs_chem.weight.values
+    assert obs.loc[(obs.oname=='hm') & (obs.weight>0)].shape[0] == obs_chem.loc[obs_chem.meas<1e30].shape[0]
+    assert obs.loc[(obs.oname=='hm') & (obs.weight>0)].weight.sum() == obs_chem.loc[obs_chem.meas<1e30].shape[0]
+    obs.loc[zero_weight_obs, 'weight'] = 0.0
+    obs.loc[obs_chem.obsnme, 'oname'] = obs_chem.oname.values #oname per var
+
+    pst.write(os.path.join(template_ws, f"{casename}.pst"), version=2)
+    return pst
 
 def main():
-    # from mf6rtm.externalio import Regenerator
-    # ws = prep_model_dir(name='reactive_pest')
+    # ws = prep_model_dir(name='reactive')
     # nlay = 12
     # nrow = 10
     # ncol = 51
@@ -1106,8 +1200,16 @@ def main():
     # sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
 
     # pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
-    org_d = os.path.join('model','reactive_pest')
-    setup_pest(org_d, num_reals=50, 
-               template_ws=os.path.join('pest','pst_template'))
+    template_ws=os.path.join('pest','pst_template')
+    org_d = os.path.join('model','reactive')
+    setup_pest(org_d, num_reals=10)
+    set_obsval_and_weights()
+    build_noise_ensemble()
+    md=os.path.join('pest','master')
+    run_pestpp(md=md, td=template_ws, casename="dizon36", 
+               noptmax=-1,freeze=True,
+               num_workers=3, worker_root=".", 
+               pestpp_version="ies",restart=False,
+               reuse_master=False, cleanup=True)
 if __name__ == "__main__":
     main()
