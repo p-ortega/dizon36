@@ -1177,13 +1177,13 @@ def set_obsval_and_weights(casename="dizon36",
 
     obs_chem = pd.merge(obs_hm, obs_chem, on=['time','obsid', 'variable'])
     obs_chem.loc[obs_chem.meas<1e30, 'weight'] = 1.0
-    obs_chem['oname'] = obs_chem['variable']
+    obs_chem['obgnme'] = obs_chem['variable']
     obs.loc[obs_chem.obsnme, 'obsval'] = obs_chem.meas.values
     obs.loc[obs_chem.obsnme, 'weight'] = obs_chem.weight.values
     assert obs.loc[(obs.oname=='hm') & (obs.weight>0)].shape[0] == obs_chem.loc[obs_chem.meas<1e30].shape[0]
     assert obs.loc[(obs.oname=='hm') & (obs.weight>0)].weight.sum() == obs_chem.loc[obs_chem.meas<1e30].shape[0]
     obs.loc[zero_weight_obs, 'weight'] = 0.0
-    obs.loc[obs_chem.obsnme, 'oname'] = obs_chem.oname.values #oname per var
+    obs.loc[obs_chem.obsnme, 'obgnme'] = obs_chem.obgnme.values #oname per var
 
     pst.write(os.path.join(template_ws, f"{casename}.pst"), version=2)
     return pst
@@ -1208,7 +1208,7 @@ def main():
     md=os.path.join('pest','master')
     run_pestpp(md=md, td=template_ws, casename="dizon36", 
                noptmax=-1,freeze=True,
-               num_workers=3, worker_root=".", 
+               num_workers=10, worker_root=".", 
                pestpp_version="ies",restart=False,
                reuse_master=False, cleanup=True)
 if __name__ == "__main__":
