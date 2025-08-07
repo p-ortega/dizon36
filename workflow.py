@@ -28,19 +28,28 @@ perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
             (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
 
 def clean_obs_chem(datadir = "data",
-                    input_path="obs_chem_raw.csv", 
+                    input_path="obs_chem_raw_0.csv", 
                    output_path="obs_chem_cleaned.csv"):
     """Load, clean, and save obs_chem data by converting units of specific variables."""
     input_path = os.path.join(datadir, input_path)
     output_path = os.path.join(datadir, output_path)
     obsdata = pd.read_csv(input_path)
-    
+    obsdata.loc[:, 'obsid'] = obsdata['obsid'].str.lower()
+
+    data_source2 = pd.read_csv(os.path.join("data", "obs_chem_raw_1.csv"))
+    to_pull = ['Fe2', 'Fe3', 'tic']
+    data_source2=data_source2[data_source2["var"].isin(to_pull)].copy()
+    data_source2['units'] = 'mol_l'
+    data_source2=data_source2[obsdata.columns]
+
+    obsdata = pd.concat([obsdata, data_source2])
+
     # Standardize column name
     obsdata.rename(columns={'var': 'variable'}, inplace=True)
     
     # Unit conversions
     unit_conversions = {
-        'Cl': 1e-3,   # mmol/L → mol/L
+        # 'Cl': 1/(58.44*1e3),   # mmol/L → mol/L
         'Tmp': 1e-3,  # apply scaling to be consistent with outputs
     }
 
@@ -771,15 +780,6 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
             pbulk = 1850
             bulk_density = np.ones(shape=(nlay,ncol, nrow))*pbulk
             ne=0.35
-        # if comp=='O' or comp=='H' or comp=="Charge":
-        #     # kd = 2*ne/1850
-        #     distcoef = np.ones(shape=(nlay,ncol, nrow))*1e-3
-        #     sorption = "Linear"
-        #     # distcoef = None
-        #     # sorption = None
-        #     pbulk = 1850
-        #     bulk_density = np.ones(shape=(nlay,ncol, nrow))*pbulk
-        #     ne=1
         else:
             distcoef = None
             sorption = None
@@ -976,31 +976,29 @@ def process_sim_conc(wd='.'):
     dfmerged.replace(np.nan,1e30).to_csv(os.path.join(wd, fname))
     print(f"Processed conc saved in {wd}/{fname}")
 
-    # files= []
-    # #lets explode them
-    # for var in dfmerged.variable.unique():
-    #     fname = f'_obs.conc.{var}.csv'
-    #     print(f"Processed conc {var} saved in {wd}/{fname}")
-    #     files.append(fname)
-    #     dfmerged[dfmerged.variable==var].replace(np.nan,1e30).to_csv(os.path.join(wd, fname), 
-    #                                                                  float_format="%.5e")
     return fname
+
+def add_std_to_pst(casename="dizon36",
+                    template_ws=os.path.join("pest","pst_template"),
+                    fraction=1):
+    pst = pyemu.Pst(os.path.join(template_ws,f"{casename}.pst"))
+    obs = pst.observation_data
+    obs['standard_deviation'] = obs['obsval']*fraction
+    pst.write(os.path.join(template_ws, f"{casename}.pst"), version=2)
 
 def build_noise_ensemble(casename="dizon36",
                          template_ws=os.path.join("pest","pst_template")):
 
     pst = pyemu.Pst(os.path.join(template_ws,f"{casename}.pst"))
     obs = pst.observation_data
-
+    cov = pyemu.Cov.from_observation_data(pst)
     # get number of reals 
     pefname = os.path.join(template_ws, pst.pestpp_options["ies_parameter_ensemble"])
     pe = pyemu.ParameterEnsemble.from_binary(pst=pst, filename=pefname)
     num_reals = pe.shape[0]
 
     # gerenate noise ensemble
-    oe = pyemu.ObservationEnsemble.from_gaussian_draw(pst, num_reals=num_reals)
-
-    oe.iloc[:,:].values[oe.iloc[:,:].values < 0] = 0
+    oe = pyemu.ObservationEnsemble.from_gaussian_draw(pst, cov=cov, num_reals=num_reals)
 
     assert oe.columns.isin(obs.obsnme).all()
 
@@ -1055,7 +1053,7 @@ def setup_pest(org_d, num_reals=50,
                             index_cols=['time','obsid','variable'], 
                             use_cols=['sim'], 
                             prefix=f"hm") 
-    pp_v = pyemu.geostats.ExpVario(contribution=1, a=150, anisotropy=2, bearing=0.0)
+    pp_v = pyemu.geostats.ExpVario(contribution=1, a=25, anisotropy=1, bearing=0.0)
     pp_gs = pyemu.geostats.GeoStruct(variograms=pp_v, transform='log')
 
     tag_list = ["npf_k_", 
@@ -1064,8 +1062,8 @@ def setup_pest(org_d, num_reals=50,
                 "kinetic_phases.Pyrite.m0.",
                 "equilibrium_phases.Orgmatter.m0.",
                 ]
-    lb=0.1
-    ub=10.0
+    lb=0.01
+    ub=100.0
     for tag in tag_list:
     # uub=100.0
     # ulb=0.01
@@ -1089,8 +1087,8 @@ def setup_pest(org_d, num_reals=50,
                                 lower_bound=lb,
                                 # ult_ubound=uub,
                                 # ult_lbound=ulb,
-                                pp_options={"pp_space":5,
-                                            "prep_hyperpars":True},
+                                pp_options={"pp_space":2,
+                                            "prep_hyperpars":False},
                                 geostruct=pp_gs,
                                 apply_order=2
                                 )
@@ -1106,13 +1104,13 @@ def setup_pest(org_d, num_reals=50,
                                 # ult_ubound=uub,
                                 # ult_lbound=ulb
                                 )
-            
+
             pf.add_observations(f,
                                 prefix=base,
                                 obsgp=base,
                                 zone_array=ib[layer]
                                 )
-        
+
     pst = pf.build_pst()
     pe = draw_prior_pe(num_reals, pf, template_ws)
     if pf.pst.npar < 35000:
@@ -1141,11 +1139,10 @@ def run_pestpp(md=f"master", td="pst_template", casename="isr",
     pst.write(os.path.join(td, f"{casename}.pst"), version=2)
     # run
     pyemu.os_utils.start_workers(td,
-                                 f'pestpp-{pestpp_version}',  # the PEST software version we want to run
-                                 f'{casename}.pst',  # the control file to use with PEST
-                                 num_workers=num_workers,  # how many agents to deploy
+                                 f'pestpp-{pestpp_version}',
+                                 f'{casename}.pst',
+                                 num_workers=num_workers,
                                  worker_root=worker_root,
-                                 # where to deploy the agent directories; relative to where python is running
                                  master_dir=md,
                                  reuse_master=reuse_master,
                                  )
@@ -1202,13 +1199,14 @@ def main():
     # pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     template_ws=os.path.join('pest','pst_template')
     org_d = os.path.join('model','reactive')
-    setup_pest(org_d, num_reals=10)
+    setup_pest(org_d, num_reals=15)
     set_obsval_and_weights()
+    add_std_to_pst(fraction=0.05)
     build_noise_ensemble()
     md=os.path.join('pest','master')
     run_pestpp(md=md, td=template_ws, casename="dizon36", 
                noptmax=-1,freeze=True,
-               num_workers=10, worker_root=".", 
+               num_workers=15, worker_root=".", 
                pestpp_version="ies",restart=False,
                reuse_master=False, cleanup=True)
 if __name__ == "__main__":
