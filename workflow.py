@@ -27,6 +27,50 @@ perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
             (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
             (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
 
+
+# def copy_gwt_model_files_from_parent(ws=".", parent_model_dir = 'gwtbenzene',
+#                                      dsp_par =  ['alh', 'ath1', 'atv'], 
+#                                  ist_par = ['porosity', 'zetaim', 'volfrac', 'bulk_density'],
+#                                  mst_par = ['buk_density']
+#                                  ):
+#     import shutil
+#     def get_transport_input_filenames(tag, template_ws=os.path.join('pest','pst_template'), 
+#                                     gwtdir = 'gwtbenzene'):
+#         template_ws = os.path.join(template_ws, gwtdir)
+#         files = [os.path.join(gwtdir,f) for f in os.listdir(template_ws) if tag in f.lower() and f.endswith(".txt")] 
+#         return files 
+#     def flatten(xss):
+#         return [x for xs in xss for x in xs]
+#     tag = []
+#     modeldirs = [name for name in os.listdir(ws) if (os.path.isdir(os.path.join(ws, name)) ) and (name.startswith('gwt'))]
+
+#     assert parent_model_dir in modeldirs, f'{parent_model_dir} does not exist in dir of models'
+    
+#     modeldirs.remove(parent_model_dir)
+
+#     for e, par in enumerate(dsp_par):
+#         tag.append(f"dsp_{par}_")
+
+#     for  e, par in enumerate(ist_par):
+#          tag.append(f"ist_{par}_")
+
+#     for  e, par in enumerate(mst_par):
+#          tag.append(f"mst_{par}_")
+         
+#     fnames_to_copy = sorted([get_transport_input_filenames(t, template_ws=ws, gwtdir = parent_model_dir) for t in tag])
+#     fnames_to_copy = flatten(fnames_to_copy)
+    
+#     for dir in modeldirs:
+#         fnames_to_replace = sorted([get_transport_input_filenames(t, template_ws=ws, gwtdir = dir) for t in tag])
+#         fnames_to_replace = flatten(fnames_to_replace)
+#         assert sorted([x.split('.')[1] for x in fnames_to_copy]) == sorted([x.split('.')[1] for x in fnames_to_replace]), f'list of files to replace and to copy does not contain the same files names '
+#         # sort fnames_to_copy and fnames_to_replace according to the assert above
+#         fnames_to_copy = [x for _, x in sorted(zip([x.split('.')[1] for x in fnames_to_copy], fnames_to_copy))]
+#         fnames_to_replace = [x for _, x in sorted(zip([x.split('.')[1] for x in fnames_to_replace], fnames_to_replace))]
+#         fileszipped = list(zip(fnames_to_copy, fnames_to_replace))
+#         [shutil.copyfile(os.path.join(ws, f[0]), os.path.join(ws, f[1])) for f in fileszipped]
+#     return fileszipped
+
 def clean_obs_chem(datadir = "data",
                     input_path="obs_chem_raw_0.csv", 
                    output_path="obs_chem_cleaned.csv"):
@@ -1053,7 +1097,10 @@ def setup_pest(org_d, num_reals=50,
                             index_cols=['time','obsid','variable'], 
                             use_cols=['sim'], 
                             prefix=f"hm") 
-    pp_v = pyemu.geostats.ExpVario(contribution=1, a=25, anisotropy=1, bearing=0.0)
+    pp_v = pyemu.geostats.ExpVario(contribution=1,
+                                   a=25,
+                                   anisotropy=1,
+                                   bearing=0.0)
     pp_gs = pyemu.geostats.GeoStruct(variograms=pp_v, transform='log')
 
     tag_list = ["npf_k_", 
@@ -1061,9 +1108,14 @@ def setup_pest(org_d, num_reals=50,
                 "sto_ss_",
                 "kinetic_phases.Pyrite.m0.",
                 "equilibrium_phases.Orgmatter.m0.",
+                "exchange_phases.CaX2.m0",
+                "exchange_phases.FeX2.m0",
+                "exchange_phases.KX.m0",
+                "exchange_phases.MgX2.m0",
+                "exchange_phases.NaX.m0",
                 ]
-    lb=0.01
-    ub=100.0
+    lb=0.1
+    ub=10.0
     for tag in tag_list:
     # uub=100.0
     # ulb=0.01
@@ -1186,28 +1238,31 @@ def set_obsval_and_weights(casename="dizon36",
     return pst
 
 def main():
-    # ws = prep_model_dir(name='reactive')
-    # nlay = 12
-    # nrow = 10
-    # ncol = 51
-    # mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    # tracer = None
+    clean_obs_chem(datadir = "data",
+                    input_path="obs_chem_raw_0.csv", 
+                   output_path="obs_chem_cleaned.csv")
+    ws = prep_model_dir(name='reactive_demo')
+    nlay = 12
+    nrow = 10
+    ncol = 51
+    mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
+    tracer = None
 
-    # sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
-    # sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
+    sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
+    sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
 
-    # pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
-    template_ws=os.path.join('pest','pst_template')
-    org_d = os.path.join('model','reactive')
-    setup_pest(org_d, num_reals=15)
-    set_obsval_and_weights()
-    add_std_to_pst(fraction=0.05)
-    build_noise_ensemble()
-    md=os.path.join('pest','master')
-    run_pestpp(md=md, td=template_ws, casename="dizon36", 
-               noptmax=-1,freeze=True,
-               num_workers=15, worker_root=".", 
-               pestpp_version="ies",restart=False,
-               reuse_master=False, cleanup=True)
+    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+    # template_ws=os.path.join('pest','pst_template')
+    # org_d = os.path.join('model','reactive')
+    # setup_pest(org_d, num_reals=15)
+    # set_obsval_and_weights()
+    # add_std_to_pst(fraction=0.05)
+    # build_noise_ensemble()
+    # md=os.path.join('pest','master0')
+    # run_pestpp(md=md, td=template_ws, casename="dizon36", 
+    #            noptmax=-1,freeze=True,
+    #            num_workers=10, worker_root=".", 
+    #            pestpp_version="ies",restart=False,
+    #            reuse_master=False, cleanup=True)
 if __name__ == "__main__":
     main()
