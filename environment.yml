@@ -12,14 +12,11 @@ dependencies:
   - rtree
   - pyproj>=2.0
   - pyshp
-  - git
   - scikit-learn
   - shapely
   - pip:
-      - mf6rtm>=0.1.10
       - flopy
       - pyemu
       - pypestutils
-
-
-
+      - vtk
+      - git+https://github.com/p-ortega/mf6rtm.git@feature/externalio
