@@ -1237,32 +1237,44 @@ def set_obsval_and_weights(casename="dizon36",
     pst.write(os.path.join(template_ws, f"{casename}.pst"), version=2)
     return pst
 
-def main():
-    clean_obs_chem(datadir = "data",
-                    input_path="obs_chem_raw_0.csv", 
-                   output_path="obs_chem_cleaned.csv")
-    ws = prep_model_dir(name='reactive_demo')
-    nlay = 12
-    nrow = 10
-    ncol = 51
-    mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    tracer = None
+def main(prep_obs = True, run_base = True, 
+         prep_pest = False, run_pest = False):
 
-    sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
-    sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
+    if prep_obs:
+        clean_obs_chem(datadir = "data",
+                        input_path="obs_chem_raw_0.csv", 
+                    output_path="obs_chem_cleaned.csv")
+    
+    if run_base:
+        ws = prep_model_dir(name='reactive')
+        nlay = 12
+        nrow = 10
+        ncol = 51
+        mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
+        tracer = None
 
-    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
-    # template_ws=os.path.join('pest','pst_template')
-    # org_d = os.path.join('model','reactive')
-    # setup_pest(org_d, num_reals=15)
-    # set_obsval_and_weights()
-    # add_std_to_pst(fraction=0.05)
-    # build_noise_ensemble()
-    # md=os.path.join('pest','master0')
-    # run_pestpp(md=md, td=template_ws, casename="dizon36", 
-    #            noptmax=-1,freeze=True,
-    #            num_workers=10, worker_root=".", 
-    #            pestpp_version="ies",restart=False,
-    #            reuse_master=False, cleanup=True)
+        sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
+        sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
+
+        pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+    if prep_pest:
+        template_ws=os.path.join('pest','pst_template')
+        org_d = os.path.join('model','reactive')
+        setup_pest(org_d, num_reals=15)
+        set_obsval_and_weights()
+        add_std_to_pst(fraction=0.05)
+        build_noise_ensemble()
+    if run_pest:
+        md=os.path.join('pest','master0')
+        run_pestpp(md=md, td=template_ws, casename="dizon36", 
+                noptmax=-1,freeze=True,
+                num_workers=10, worker_root=".", 
+                pestpp_version="ies",restart=False,
+                reuse_master=False, cleanup=True)
 if __name__ == "__main__":
-    main()
+    main(
+        prep_obs = True,
+        run_base = True,
+        prep_pest = False,
+        run_pest = False
+    )
