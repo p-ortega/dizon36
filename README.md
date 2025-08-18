@@ -9,11 +9,12 @@ The main workflow is controlled through boolean flags. Toggle these to enable or
 prep_obs = True   # prepare observation CSVs  
 run_base = True   # build and run a base model  
 prep_pest = False # prepare PEST++ setup  
-run_pest = False  # run PEST++ calibration/uncertainty analysis  
+run_pest = False  # run PEST++ analysis  
 ```
 
 ## Plots
-A companion Jupyter Notebook is included for generating plots. Feel free to edit and adapt it for your own analyses.
+A Jupyter Notebook is included for generating plots.
+Feel free to edit and adapt it for your own analyses.
 
 ## Dependencies  
 
