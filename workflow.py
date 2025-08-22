@@ -452,8 +452,8 @@ def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39):
     init_rates_out  = [-300,  -30,  -30]                # 3 negatives
     fini_rates_out  = [-400,  -40,  -40]
 
-    init_sp = range(0, 36)   # stress periods 0 – 35
-    fini_sp = range(36, nper)  # stress periods 36 – 38
+    init_sp = range(0, 35)   # stress periods 0 – 35
+    fini_sp = range(35, nper)  # stress periods 36 – 38
     all_sp  = (*init_sp, *fini_sp)
 
 
@@ -1189,27 +1189,27 @@ def set_obsval_and_weights(casename="dizon36",
     return pst
 
 def main():
-    # ws = prep_model_dir(name='reactive')
-    # nlay = 12
-    # nrow = 10
-    # ncol = 51
-    # mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-    # tracer = None
+    ws = prep_model_dir(name='reactive')
+    nlay = 12
+    nrow = 10
+    ncol = 51
+    mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
+    tracer = None
 
-    # sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
-    # sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
+    sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
+    sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
 
-    # pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
-    template_ws=os.path.join('pest','pst_template')
-    org_d = os.path.join('model','reactive')
-    setup_pest(org_d, num_reals=10)
-    set_obsval_and_weights()
-    build_noise_ensemble()
-    md=os.path.join('pest','master')
-    run_pestpp(md=md, td=template_ws, casename="dizon36", 
-               noptmax=-1,freeze=True,
-               num_workers=10, worker_root=".", 
-               pestpp_version="ies",restart=False,
-               reuse_master=False, cleanup=True)
+    pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+    #template_ws=os.path.join('pest','pst_template')
+    #org_d = os.path.join('model','reactive')
+    #setup_pest(org_d, num_reals=10)
+    #set_obsval_and_weights()
+    #build_noise_ensemble()
+    #md=os.path.join('pest','master')
+    #run_pestpp(md=md, td=template_ws, casename="dizon36", 
+    #           noptmax=-1,freeze=True,
+    #           num_workers=10, worker_root=".", 
+    #           pestpp_version="ies",restart=False,
+    #           reuse_master=False, cleanup=True)
 if __name__ == "__main__":
     main()
