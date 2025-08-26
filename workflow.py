@@ -435,6 +435,7 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.set_config(
                     reactive_timing='all',
                     reactive_externalio=True,
+                    emulator_training_data=True,
                     # tsteps=tsteps
                     )
     model.set_componenth2o(True)
@@ -1253,7 +1254,7 @@ def main(prep_obs = True, run_base = True,
         sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
         sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
 
-        pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+        # pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     if prep_pest:
         template_ws=os.path.join('pest','pst_template')
         org_d = os.path.join('model','reactive')
