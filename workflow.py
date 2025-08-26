@@ -432,10 +432,46 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.set_phases(equilibriums)
     # model.set_charge_offset(1e-3)
     tsteps = create_output_pairs(perioddata, output_interval=2)
+
+    # machine learning variables
+    targetvars = [
+    'Orgc','O0','tic','C_4',
+    'Fe2','Fe3','N3','NO3',
+    'S_2','SO4','Amm',
+    'N0','pH',
+    'pe','EQUI_Ferrihydrite',
+    'EQUI_Orgmatter',
+    'MOL_CaX2','MOL_FeX2',
+    'MOL_KX','MOL_MgX2',
+    'MOL_NaX','KIN_Pyrite'
+    ]
+    featvars = [
+    'Orgc',
+    # 'O0',
+    # 'tic',
+    # 'C_4',
+    # 'Fe2',
+    # 'Fe3',
+    # 'N3',
+    # 'NO3',
+    # 'S_2',
+    # 'SO4',
+    # 'Amm',
+    # 'N0',
+    # 'pH',
+    # 'pe',
+    'EQUI_Ferrihydrite',
+    'EQUI_Orgmatter',
+    'MOL_CaX2','MOL_FeX2',
+    'MOL_KX','MOL_MgX2',
+    'MOL_NaX','KIN_Pyrite'
+    ]
     model.set_config(
                     reactive_timing='all',
                     reactive_externalio=True,
                     emulator_training_data=True,
+                    emulator_target_variables=targetvars,
+                    emulator_feature_variables=featvars,
                     # tsteps=tsteps
                     )
     model.set_componenth2o(True)
@@ -1254,7 +1290,7 @@ def main(prep_obs = True, run_base = True,
         sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
         sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
 
-        # pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+        pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     if prep_pest:
         template_ws=os.path.join('pest','pst_template')
         org_d = os.path.join('model','reactive')
