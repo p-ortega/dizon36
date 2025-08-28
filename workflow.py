@@ -1,11 +1,9 @@
 import os
 import shutil
-import subprocess
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import flopy
-import itertools
 import pyemu
 from mf6rtm import utils, mup3d
 from collections import defaultdict
@@ -299,8 +297,6 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     ## let's process the injection chem
     injdf = pd.read_csv(os.path.join(datadir,"wellin.csv"), index_col = 0)
     injdf = injdf[['layer'] + solutionsdf.index.tolist()].copy()
-    injdf
-    layers_inj = list(injdf.layer.unique())
 
     frames = []                     
 
@@ -436,8 +432,46 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.set_phases(equilibriums)
     # model.set_charge_offset(1e-3)
     tsteps = create_output_pairs(perioddata, output_interval=2)
+
+    # machine learning variables
+    targetvars = [
+    'Orgc','O0','tic','C_4',
+    'Fe2','Fe3','N3','NO3',
+    'S_2','SO4','Amm',
+    'N0','pH',
+    'pe','EQUI_Ferrihydrite',
+    'EQUI_Orgmatter',
+    'MOL_CaX2','MOL_FeX2',
+    'MOL_KX','MOL_MgX2',
+    'MOL_NaX','KIN_Pyrite'
+    ]
+    featvars = [
+    'Orgc',
+    # 'O0',
+    # 'tic',
+    # 'C_4',
+    # 'Fe2',
+    # 'Fe3',
+    # 'N3',
+    # 'NO3',
+    # 'S_2',
+    # 'SO4',
+    # 'Amm',
+    # 'N0',
+    # 'pH',
+    # 'pe',
+    'EQUI_Ferrihydrite',
+    'EQUI_Orgmatter',
+    'MOL_CaX2','MOL_FeX2',
+    'MOL_KX','MOL_MgX2',
+    'MOL_NaX','KIN_Pyrite'
+    ]
     model.set_config(
-                    reaction_timing='all', 
+                    reactive_timing='all',
+                    reactive_externalio=True,
+                    emulator_training_data=True,
+                    emulator_target_variables=targetvars,
+                    emulator_feature_variables=featvars,
                     # tsteps=tsteps
                     )
     model.set_componenth2o(True)
@@ -1294,7 +1328,7 @@ def main(prep_obs = True, run_base = True,
                 reuse_master=False, cleanup=True)
 if __name__ == "__main__":
     main(
-        prep_obs = True,
+        prep_obs = False,
         run_base = True,
         prep_pest = False,
         run_pest = False
