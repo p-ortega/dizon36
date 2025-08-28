@@ -1237,6 +1237,27 @@ def set_obsval_and_weights(casename="dizon36",
     pst.write(os.path.join(template_ws, f"{casename}.pst"), version=2)
     return pst
 
+
+def get_trainingdata():
+    ws = os.path.join("model","reactive")
+    modeltimes = pd.read_csv(os.path.join(ws, "obs_Si.csv"),usecols=['time'])
+    # get time change
+    days = modeltimes['time'].diff().fillna(1)
+
+    index_cols = ['time', 'cell']
+
+    X = pd.read_csv(os.path.join(ws, '_mf6_to_phr.csv'))
+    X['days'] = days
+    X.sort_values(by=['time','cell'], inplace=True)
+    
+    y = pd.read_csv(os.path.join(ws, '_phr_to_mf6.csv'))
+    y.sort_values(by=['time','cell'], inplace=True)
+
+    value_cols = [i for i in y.columns if i not in index_cols]
+    ydiff = X.loc[:,value_cols] - y.loc[:,value_cols]
+
+    return X,y,ydiff
+
 def main(prep_obs = True, run_base = True, 
          prep_pest = False, run_pest = False):
 
