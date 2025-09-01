@@ -466,6 +466,7 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     'MOL_KX','MOL_MgX2',
     'MOL_NaX','KIN_Pyrite'
     ]
+
     model.set_config(
                     reactive_timing='all',
                     reactive_externalio=True,
