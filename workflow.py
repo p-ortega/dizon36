@@ -10,6 +10,15 @@ from collections import defaultdict
 from flopy.utils.gridintersect import GridIntersect
 from collections.abc import Iterable
 
+import keras_tuner as kt
+import tensorflow as tf
+from tensorflow.keras import mixed_precision
+from tensorflow.keras.callbacks import EarlyStopping
+mixed_precision.set_global_policy('mixed_float16')
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import pickle
+
 datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
 props_ws = os.path.join(datadir, 'props')
@@ -447,19 +456,19 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     ]
     featvars = [
     'Orgc',
-    # 'O0',
-    # 'tic',
-    # 'C_4',
-    # 'Fe2',
-    # 'Fe3',
-    # 'N3',
-    # 'NO3',
-    # 'S_2',
-    # 'SO4',
-    # 'Amm',
-    # 'N0',
-    # 'pH',
-    # 'pe',
+     'O0', #NOTE: including all, because they are needed to calculate the change
+     'tic',
+     'C_4',
+     'Fe2',
+     'Fe3',
+     'N3',
+     'NO3',
+     'S_2',
+     'SO4',
+     'Amm',
+     'N0',
+     'pH',
+     'pe',
     'EQUI_Ferrihydrite',
     'EQUI_Orgmatter',
     'MOL_CaX2','MOL_FeX2',
@@ -1274,23 +1283,380 @@ def set_obsval_and_weights(casename="dizon36",
 
 def get_trainingdata():
     ws = os.path.join("model","reactive")
-    modeltimes = pd.read_csv(os.path.join(ws, "obs_Si.csv"),usecols=['time'])
-    # get time change
-    days = modeltimes['time'].diff().fillna(1)
 
-    index_cols = ['time', 'cell']
-
-    X = pd.read_csv(os.path.join(ws, '_mf6_to_phr.csv'))
-    X['days'] = days
+    X = pd.read_csv(os.path.join(ws, '_features.csv'))
     X.sort_values(by=['time','cell'], inplace=True)
-    
-    y = pd.read_csv(os.path.join(ws, '_phr_to_mf6.csv'))
+
+    y = pd.read_csv(os.path.join(ws, '_targets.csv'))
     y.sort_values(by=['time','cell'], inplace=True)
 
-    value_cols = [i for i in y.columns if i not in index_cols]
-    ydiff = X.loc[:,value_cols] - y.loc[:,value_cols]
 
-    return X,y,ydiff
+    #index_cols = ['time', 'cell']
+    #value_cols = [i for i in y.columns if i not in index_cols]
+    #ydiff = X.loc[:,value_cols] - y.loc[:,value_cols]
+
+    return X,y #,ydiff
+
+def preprocess_data(X, y,test_size=0.2):
+
+    X = X.drop(columns=['time','cell'])
+    y = y.drop(columns=['time','cell'])
+
+    # Split the data into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+
+    # Scale the features
+    X_scaler = StandardScaler()
+    X_train = X_scaler.fit_transform(X_train)
+    X_test = X_scaler.transform(X_test)
+
+    # scale the output features
+    y_scaler = StandardScaler()
+    y_train = y_scaler.fit_transform(y_train)
+    y_test = y_scaler.transform(y_test)
+
+    return X_train, X_test, X_scaler, y_train, y_test, y_scaler
+
+def hyper_parameter_tuning(X, y, sample_size, loss_fn="mse"):
+
+
+    X_sub = X.sample(n=sample_size, random_state=42)
+    y_sub = y.loc[X_sub.index]
+    
+    X_train, X_test, X_scaler, y_train, y_test, y_scaler = preprocess_data(X_sub, y_sub)
+
+    def build_model(hp):
+        model = tf.keras.Sequential()
+        # First hidden layer
+        model.add(tf.keras.layers.Dense(
+            units=hp.Int('units1', min_value=32, max_value=2*256, step=32),
+            activation='relu',
+            input_shape=(X_train.shape[1],)
+        ))
+        model.add(tf.keras.layers.BatchNormalization())
+        model.add(tf.keras.layers.Dropout(hp.Float('dropout1', 0.0, 0.5, step=0.1)))
+        # Second hidden layer
+        model.add(tf.keras.layers.Dense(
+            units=hp.Int('units2', min_value=32, max_value=2*256, step=32),
+            activation='relu'
+        ))
+        model.add(tf.keras.layers.BatchNormalization())
+        model.add(tf.keras.layers.Dropout(hp.Float('dropout2', 0.0, 0.5, step=0.1)))
+        # Third hidden layer
+        model.add(tf.keras.layers.Dense(
+            units=hp.Int('units3', min_value=32, max_value=2*256, step=32),
+            activation='relu'
+        ))
+        model.add(tf.keras.layers.BatchNormalization())
+        model.add(tf.keras.layers.Dropout(hp.Float('dropout3', 0.0, 0.5, step=0.1)))
+        # Output layer
+        model.add(tf.keras.layers.Dense(y_train.shape[1]))
+        # Compile
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(
+                hp.Float('lr', 1e-5, 1e-2, sampling='log')
+            ),
+            loss=loss_fn,
+            metrics=['mae','mse']
+        )
+        return model
+
+    tuner = kt.BayesianOptimization(
+        build_model,
+        objective='val_loss',
+        max_trials=20,
+        directory='tuning_dir',
+        project_name='nnet_tuning',
+    )
+
+    early_stop = EarlyStopping(patience=10, restore_best_weights=True)
+
+    tuner.search(
+        X_train, y_train,
+        validation_data=(X_test,y_test),
+        epochs=100,
+        batch_size=512,
+        callbacks=[early_stop]
+    )
+    
+    best_model = tuner.get_best_models(num_models=1)[0]
+    return best_model
+
+# create a surrogate Class
+class SurrogateModel:
+
+    def __init__(self, model, scalers):
+        """Initialize the surrogate model with a trained model and scalers.
+
+        model: A trained machine learning model.
+        scalers: A dictionary of scalers for feature and target variables.
+        """
+        self.model = model
+        self.scaler = scalers
+
+    def predict(self, X, apply_scale_to_X=True):
+        X = X.copy()
+        if isinstance(X, pd.DataFrame):
+            try:
+                X = X.drop(columns=['time','cell'])
+            except KeyError:
+                pass
+        if apply_scale_to_X:
+            if "X" in self.scaler.keys() and self.scaler["X"] is not None:
+                X = self.scaler["X"].transform(X)
+        pred = self.model.predict(X)
+        if "y" in self.scaler.keys():
+            pred = self.scaler["y"].inverse_transform(pred)
+        return pred
+    
+    def save(self, model_path):
+        with open(model_path, 'wb') as f:
+            pickle.dump(self, f)
+
+    def load(model_path):
+        # instantiate an empty SurrogateModel class and load attributes form pickle
+        surrogate = SurrogateModel.__new__(SurrogateModel)
+        with open(model_path, 'rb') as f:
+            surrogate.__dict__ = pickle.load(f).__dict__
+        return surrogate
+
+
+
+def plot_y_vs_yhat(columns,result_dict):
+
+    #save to pdf
+    from matplotlib.backends.backend_pdf import PdfPages
+    import matplotlib.pyplot as plt
+    #y = y.drop(columns=['time','cell'])
+    #yhat = pd.DataFrame(yhat, columns=y.columns)
+
+    marker_dict = {
+        "train":{"color":'0.5', "marker":'o', "size": 20},
+        "test":{"color":'b', "marker":'x', "size": 10}
+    }
+
+    with PdfPages('y_vs_yhat.pdf') as pdf:
+        for e,col in enumerate(columns):
+            print(col)
+
+            fig,ax = plt.subplots(1,1,figsize=(4,4))
+
+            for key in result_dict.keys():
+                y = result_dict[key]['y'][:,e]
+                yhat = result_dict[key]['yhat'][:,e]
+                ax.scatter(y, yhat, label=key,
+                           alpha=0.3,
+                           c=marker_dict[key]['color'],
+                           marker=marker_dict[key]['marker'])
+
+            ax.set_title(col)
+            ax.set_xlabel('Actual')
+            ax.set_ylabel('Predicted')
+            ax.legend()
+
+            # set y and x limits to same values
+            lims = ax.get_xlim()
+            lims2 = ax.get_ylim()
+            xmax = max(lims[1], lims2[1])
+            xmin = min(lims[0], lims2[0])
+            ax.set_xlim([xmin, xmax])
+            ax.set_ylim([xmin, xmax])
+            ax.plot([xmin, xmax], [xmin, xmax], 'k--')
+            ax.set_aspect('equal')
+            fig.tight_layout()
+            pdf.savefig(fig,dpi=90)
+            plt.show()
+
+            
+
+    return
+
+class PhysicsInformedLoss(tf.keras.losses.Loss):
+    """
+    Physics-informed custom loss for geochemical surrogate models.
+
+    Penalizes:
+        1. Standard MSE between predicted and true values
+        2. Negative concentrations (non-negativity)
+        3. Mass imbalance (element totals vs species)
+        4. Charge imbalance
+        5. Redox inconsistency across electron-transfer couples
+
+    Parameters
+    ----------
+    cols : list of str
+        Column names in the same order as model outputs.
+    element_balances : dict
+        Mapping {element: [species_list]} for mass balance.
+    redox_couples : dict
+        Mapping {name: (oxidized_species, reduced_species, n_electrons)}.
+    weights : dict
+        Optional weights for each penalty component, e.g.:
+        {
+            "mse": 1.0, "nonneg": 0.1, "mass": 0.5,
+            "charge": 0.5, "redox": 0.3
+        }
+    charges : dict
+        Ionic charges of species for charge balance.
+    eps : float
+        Small number to prevent log(0) or division by zero.
+    """
+
+    def __init__(self, 
+                 cols,
+                 element_balances,
+                 redox_couples,
+                 charges,
+                 weights=None,
+                 eps=1e-12,
+                 name="PhysicsInformedLoss"):
+        super().__init__(name=name)
+        self.cols = cols
+        self.element_balances = element_balances
+        self.redox_couples = redox_couples
+        self.charges = charges
+        self.eps = eps
+
+        default_weights = {"mse": 1.0, "nonneg": 0.1, "mass": 0.5, "charge": 0.5, "redox": 0.3}
+        self.weights = weights if weights is not None else default_weights
+
+    # -------------------
+    # Mass balance penalty
+    # -------------------
+    def mass_balance_penalty(self, y_pred):
+        penalties = []
+        for elem, species_list in self.element_balances.items():
+            if elem not in self.cols:
+                continue
+            total = y_pred[:, self.cols.index(elem)]
+            summed_species = 0.0
+            for sp in species_list:
+                if sp in self.cols:
+                    summed_species += y_pred[:, self.cols.index(sp)]
+            penalties.append(tf.reduce_mean(tf.square(total - summed_species)))
+        return tf.add_n(penalties) if penalties else 0.0
+
+    # -------------------
+    # Charge balance penalty
+    # -------------------
+    def charge_balance_penalty(self, y_pred):
+        total_charge = 0.0
+        for sp, z in self.charges.items():
+            if sp in self.cols:
+                total_charge += z * y_pred[:, self.cols.index(sp)]
+        if "Charge" in self.cols:
+            predicted_charge = y_pred[:, self.cols.index("Charge")]
+            return tf.reduce_mean(tf.square(predicted_charge - total_charge))
+        else:
+            return 0.0
+
+    # -------------------
+    # Redox penalty
+    # -------------------
+    def redox_penalty(self, y_pred):
+        penalties = []
+        for name, (ox, red, n) in self.redox_couples.items():
+            if all(sp in self.cols for sp in [ox, red, "pe"]):
+                ox_val = y_pred[:, self.cols.index(ox)] + self.eps
+                red_val = y_pred[:, self.cols.index(red)] + self.eps
+                pe_implied = (1.0 / n) * tf.math.log(ox_val / red_val) / tf.math.log(10.0)
+                penalties.append(tf.reduce_mean(
+                    tf.square(y_pred[:, self.cols.index("pe")] - pe_implied)
+                ))
+        return tf.add_n(penalties) if penalties else 0.0
+
+    # -------------------
+    # Call method
+    # -------------------
+    def call(self, y_true, y_pred):
+        mse = tf.reduce_mean(tf.square(y_true - y_pred))
+        nonneg = tf.reduce_mean(tf.square(tf.nn.relu(-y_pred)))
+        mass = self.mass_balance_penalty(y_pred)
+        charge = self.charge_balance_penalty(y_pred)
+        redox = self.redox_penalty(y_pred)
+
+        total_loss = (self.weights["mse"] * mse +
+                      self.weights["nonneg"] * nonneg +
+                      self.weights["mass"] * mass +
+                      self.weights["charge"] * charge +
+                      self.weights["redox"] * redox)
+        return total_loss
+
+
+
+def surrogate_workflow():
+
+    X,y = get_trainingdata()
+
+
+    # Columns from your DataFrame
+    cols = y.drop(columns=["time", "cell"]).columns.tolist()
+
+    # Element balances
+    ELEMENT_BALANCES = {
+        "C": ["tic", "Orgc", "Orgc.1", "C_4"],
+        "N": ["NO3", "N3", "N0", "Amm"],
+        "S": ["SO4", "S_2"],
+        "Fe": ["Fe2", "Fe3", "MOL_FeX2"],
+        "O": ["H2O", "O0", "NO3", "SO4"]
+    }
+
+    # Redox couples
+    REDOX_COUPLES = {
+        "Fe": ("Fe3", "Fe2", 1),
+        "N": ("NO3", "N0", 5),
+        "S": ("SO4", "S_2", 8)
+    }
+
+    # Charges
+    CHARGES = {
+        "H": +1, "Ca": +2, "Cl": -1, "K": +1, "Mg": +2, "Na": +1,
+        "Fe2": +2, "Fe3": +3, "NO3": -1, "N3": -3, "Amm": +1,
+        "S_2": -2, "SO4": -2
+    }
+
+    # Instantiate loss
+    loss_fn = PhysicsInformedLoss(
+        cols=cols,
+        element_balances=ELEMENT_BALANCES,
+        redox_couples=REDOX_COUPLES,
+        charges=CHARGES   
+    )
+    
+    #loss_fn = "mse"
+
+
+
+    m = hyper_parameter_tuning(X,
+                               y,
+                               sample_size=100000,
+                               loss_fn=loss_fn
+                               )
+
+    X_train, X_test, X_scaler, y_train, y_test, y_scaler = preprocess_data(X, y)
+    
+    m.fit(X_train, y_train,
+          #loss_fn=loss_fn,
+          epochs=100,
+          validation_data=(X_test, y_test),
+          batch_size=512,
+          callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+          verbose=1)
+    
+    s = SurrogateModel(m, {"X": X_scaler, "y": y_scaler})
+
+    s.save('surrogate_model.pkl')
+
+    yhat_train = s.predict(X_train, apply_scale_to_X=False)
+    yhat_test = s.predict(X_test, apply_scale_to_X=False)
+    result_dict={
+                "train":{"y":y_scaler.inverse_transform(y_train), "yhat":yhat_train},
+                "test":{"y":y_scaler.inverse_transform(y_test), "yhat":yhat_test}
+                }
+    columns = y.drop(columns=['time','cell']).columns.tolist()
+    plot_y_vs_yhat(columns,result_dict)
+
+    return
 
 def main(prep_obs = True, run_base = True, 
          prep_pest = False, run_pest = False):
@@ -1327,9 +1693,11 @@ def main(prep_obs = True, run_base = True,
                 pestpp_version="ies",restart=False,
                 reuse_master=False, cleanup=True)
 if __name__ == "__main__":
-    main(
-        prep_obs = False,
-        run_base = True,
-        prep_pest = False,
-        run_pest = False
-    )
+#   main(
+#       prep_obs = False,
+#       run_base = True,
+#       prep_pest = False,
+#       run_pest = False
+#   )
+
+    surrogate_workflow()
