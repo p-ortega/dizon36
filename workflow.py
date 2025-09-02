@@ -1902,7 +1902,10 @@ def surrogate_workflow(hyperparameter_tuning=True):
     
     log_cols = X.loc[:,~X.columns.str.lower().str.contains('|'.join(remove_cols))].columns.tolist()
     for c in ["N","Fe","N","O0","C_4","Fe2","Fe3","NO3","N0"]:
-        log_cols.remove(c)
+        try:
+            log_cols.remove(c)
+        except ValueError:
+            pass
     #for c in remove_cols:
     #    log_cols = log_cols[~log_cols.str.lower().str.contains(c)]
     #log_cols = X.columns[(X > 0).all(axis=0)].tolist()
