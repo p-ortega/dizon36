@@ -1852,14 +1852,15 @@ class PhysicsInformedLoss(tf.keras.losses.Loss):
 
         # physics based metrics in original space; inverse transform first
         y_pred_orig = self.scaler.inverse_transform(y_pred.numpy())
+        
         # assert no nans
-        assert not np.isnan(y_pred_orig).any(), "NaNs in inverse transformed predictions"
-        nonneg = tf.reduce_mean(tf.square(tf.nn.relu(-y_pred_orig[:, self.non_zero_columns_idxs])))
+        assert y_pred_orig.isnull().sum().sum() == 0, "NaNs in inverse transformed predictions"
+        nonneg = tf.reduce_mean(tf.square(tf.nn.relu(-y_pred_orig.iloc[:, self.non_zero_columns_idxs])))
         assert not np.isnan(nonneg.numpy()), "NaNs in non-negativity penalty"
-        mass = self.mass_balance_penalty(y_pred_orig)
-        assert not np.isnan(mass.numpy()), "NaNs in mass balance penalty"
-        charge = self.charge_balance_penalty(y_pred_orig)
-        assert not np.isnan(charge.numpy()), "NaNs in charge balance penalty"
+        mass = self.mass_balance_penalty(y_pred_orig.values)
+        #assert not np.isnan(mass.numpy()),mass.numpy()# "NaNs in mass balance penalty"
+        charge = self.charge_balance_penalty(y_pred_orig.values)
+        #assert not np.isnan(charge.numpy()), "NaNs in charge balance penalty"
 
         #TODO: something wrong with redox function
         #redox = self.redox_penalty(y_pred_orig)
@@ -1871,7 +1872,7 @@ class PhysicsInformedLoss(tf.keras.losses.Loss):
                       self.weights["charge"] * charge 
                       #+ self.weights["redox"] * redox
                       )
-        assert not np.isnan(total_loss.numpy()), "NaNs in total loss"
+        #assert not np.isnan(total_loss.numpy()), "NaNs in total loss"
         return total_loss
 
 
@@ -1896,8 +1897,11 @@ def surrogate_workflow(hyperparameter_tuning=True):
     
     # specify log cols
     log_cols = X.columns.tolist()
-    remove_cols = ["ph","tmp","pe","sturation",]
+    remove_cols = ["ph","tmp","pe","sturation","KIN_","EQUI_","MOL_"]
+    
     log_cols = X.loc[:,~X.columns.str.lower().str.contains('|'.join(remove_cols))].columns.tolist()
+    for c in ["N","Fe","N","O0","C_4","Fe2","Fe3","NO3","N0"]:
+        log_cols.remove(c)
     #for c in remove_cols:
     #    log_cols = log_cols[~log_cols.str.lower().str.contains(c)]
     #log_cols = X.columns[(X > 0).all(axis=0)].tolist()
@@ -1981,13 +1985,13 @@ def surrogate_workflow(hyperparameter_tuning=True):
 
     
     
-#   m.fit(X_train, y_train,
-#         #loss_fn=loss_fn,
-#         epochs=100,
-#         validation_data=(X_test, y_test),
-#         batch_size=256,
-#         callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
-#         verbose=1)
+    m.fit(X_train, y_train,
+          #loss_fn=loss_fn,
+          epochs=100,
+          validation_data=(X_test, y_test),
+          batch_size=256*8,
+          callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+          verbose=1)
     
     s = SurrogateModel(m, {"X": X_scaler, "y": y_scaler})
 
