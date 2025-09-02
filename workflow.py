@@ -481,6 +481,7 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     'MOL_KX','MOL_MgX2',
     'MOL_NaX','KIN_Pyrite'
     ]
+
     model.set_config(
                     reactive_timing='all',
                     reactive_externalio=True,
@@ -554,8 +555,8 @@ def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39):
     init_rates_out  = [-300,  -30,  -30]                # 3 negatives
     fini_rates_out  = [-400,  -40,  -40]
 
-    init_sp = range(0, 36)   # stress periods 0 – 35
-    fini_sp = range(36, nper)  # stress periods 36 – 38
+    init_sp = range(0, 35)   # stress periods 0 – 35
+    fini_sp = range(35, nper)  # stress periods 36 – 38
     all_sp  = (*init_sp, *fini_sp)
 
 
@@ -2042,6 +2043,7 @@ def main(prep_obs = True, run_base = True,
                 num_workers=10, worker_root=".", 
                 pestpp_version="ies",restart=False,
                 reuse_master=False, cleanup=True)
+
 if __name__ == "__main__":
 #   main(
 #       prep_obs = False,
