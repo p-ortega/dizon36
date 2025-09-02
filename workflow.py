@@ -1,4 +1,5 @@
 import os
+from pyexpat import features
 import shutil
 import numpy as np
 import pandas as pd
@@ -14,9 +15,14 @@ import keras_tuner as kt
 import tensorflow as tf
 from tensorflow.keras import mixed_precision
 from tensorflow.keras.callbacks import EarlyStopping
+tf.config.run_functions_eagerly(True)
 mixed_precision.set_global_policy('mixed_float16')
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler,QuantileTransformer
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.mixture import GaussianMixture
+
+
 import pickle
 
 datadir = os.path.join("data")
@@ -1284,23 +1290,22 @@ def set_obsval_and_weights(casename="dizon36",
 def get_trainingdata():
     ws = os.path.join("model","reactive")
 
-    X = pd.read_csv(os.path.join(ws, '_features.csv'))
-    X.sort_values(by=['time','cell'], inplace=True)
+    features = pd.read_csv(os.path.join(ws, '_features.csv'))
+    features.sort_values(by=['time','cell'], inplace=True)
+    #features.rename(columns={'time':'t0'}, inplace=True)
 
-    y = pd.read_csv(os.path.join(ws, '_targets.csv'))
-    y.sort_values(by=['time','cell'], inplace=True)
+    targets = pd.read_csv(os.path.join(ws, '_targets.csv'))
+    targets.sort_values(by=['time','cell'], inplace=True)
+    #targets.rename(columns={'time':'t1'}, inplace=True)
 
+    df = pd.concat([features, targets], axis=1, keys=['features','targets'])
 
-    #index_cols = ['time', 'cell']
-    #value_cols = [i for i in y.columns if i not in index_cols]
-    #ydiff = X.loc[:,value_cols] - y.loc[:,value_cols]
-
-    return X,y #,ydiff
+    return df
 
 def preprocess_data(X, y,test_size=0.2):
 
-    X = X.drop(columns=['time','cell'])
-    y = y.drop(columns=['time','cell'])
+    #X = X.drop(columns=['time','cell'])
+    #y = y.drop(columns=['time','cell'])
 
     # Split the data into training and testing sets
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
@@ -1317,57 +1322,318 @@ def preprocess_data(X, y,test_size=0.2):
 
     return X_train, X_test, X_scaler, y_train, y_test, y_scaler
 
-def hyper_parameter_tuning(X, y, sample_size, loss_fn="mse"):
 
 
-    X_sub = X.sample(n=sample_size, random_state=42)
-    y_sub = y.loc[X_sub.index]
-    
-    X_train, X_test, X_scaler, y_train, y_test, y_scaler = preprocess_data(X_sub, y_sub)
+class LogStandardScaler(BaseEstimator, TransformerMixin):
+    """
+    Custom scaler: log-transform + StandardScaler.
 
-    def build_model(hp):
-        model = tf.keras.Sequential()
-        # First hidden layer
-        model.add(tf.keras.layers.Dense(
-            units=hp.Int('units1', min_value=32, max_value=2*256, step=32),
-            activation='relu',
-            input_shape=(X_train.shape[1],)
-        ))
-        model.add(tf.keras.layers.BatchNormalization())
-        model.add(tf.keras.layers.Dropout(hp.Float('dropout1', 0.0, 0.5, step=0.1)))
-        # Second hidden layer
-        model.add(tf.keras.layers.Dense(
-            units=hp.Int('units2', min_value=32, max_value=2*256, step=32),
-            activation='relu'
-        ))
-        model.add(tf.keras.layers.BatchNormalization())
-        model.add(tf.keras.layers.Dropout(hp.Float('dropout2', 0.0, 0.5, step=0.1)))
-        # Third hidden layer
-        model.add(tf.keras.layers.Dense(
-            units=hp.Int('units3', min_value=32, max_value=2*256, step=32),
-            activation='relu'
-        ))
-        model.add(tf.keras.layers.BatchNormalization())
-        model.add(tf.keras.layers.Dropout(hp.Float('dropout3', 0.0, 0.5, step=0.1)))
-        # Output layer
-        model.add(tf.keras.layers.Dense(y_train.shape[1]))
-        # Compile
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(
-                hp.Float('lr', 1e-5, 1e-2, sampling='log')
-            ),
-            loss=loss_fn,
-            metrics=['mae','mse']
-        )
-        return model
+    - Applies log10(x + eps) to selected columns before scaling.
+    - Applies only StandardScaler to all columns.
+    - Inverse transform can return both linear and log-transformed values.
 
+    Parameters
+    ----------
+    log_cols : list of str
+        Columns to log-transform (must be strictly positive).
+    eps : float, default=1e-12
+        Small value to avoid log(0).
+    """
+    def __init__(self, log_cols=None, eps=1e-12):
+        self.log_cols = log_cols if log_cols is not None else []
+        self.eps = eps
+        self.scaler = StandardScaler()
+        self.col_order = None
+        self.shifts = {}  # Store shift per column
+
+    def fit(self, X, y=None):
+        X = X.copy()
+        self.shifts = {}
+        for col in self.log_cols:
+            min_val = X[col].min()
+            shift = 0.0
+            if min_val <= 0:
+                shift = abs(min_val) + self.eps
+            self.shifts[col] = shift
+            X[col] = np.log10(X[col] + shift)
+        self.col_order = X.columns.tolist()
+        self.scaler.fit(X)
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        for col in self.log_cols:
+            shift = self.shifts.get(col, 0.0)
+            X[col] = np.log10(X[col] + shift)
+        X_scaled = self.scaler.transform(X)
+        X_scaled = pd.DataFrame(X_scaled, columns=self.col_order)
+        return X_scaled
+
+    def inverse_transform(self, X_scaled, return_log=False):
+        """
+        Inverse-transform scaled data.
+
+        Parameters
+        ----------
+        X_scaled : np.ndarray
+            Scaled data (as from transform).
+        return_log : bool, default=False
+            If True, also return the log-transformed values (before exp).
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with either linear concentrations (default)
+            or both linear and log values (if return_log=True).
+        """
+        # Back to log-space
+        X_log = self.scaler.inverse_transform(X_scaled)
+        X_log = pd.DataFrame(X_log, columns=self.col_order)
+
+        # Copy for output
+        X_out = X_log.copy()
+
+        # Inverse log-transform only on selected cols
+        for col in self.log_cols:
+            shift = self.shifts.get(col, 0.0)
+            X_out[col] = np.power(10, X_log[col]) - shift
+
+        if return_log:
+            # Add extra columns with ".log" suffix
+            for col in self.log_cols:
+                X_out[f"{col}.log"] = X_log[col]
+
+        return X_out
+
+    def _apply_log(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X, columns=self.col_order if self.col_order else None)
+        for col in self.log_cols:
+            shift = self.shifts.get(col, self.eps)
+            X[col] = np.log10(X[col] + shift)
+        return X
+
+
+
+class ClusterLogScaler(BaseEstimator, TransformerMixin):
+    """
+    Preprocessor combining:
+    - Log10(+shift) + StandardScaler for selected cols
+    - Cluster-aware residual scaling for multimodal cols
+
+    Parameters
+    ----------
+    cluster_config : dict {col_name: n_clusters}
+        Number of clusters per feature (1 = continuous).
+    log_cols : list of str
+        Columns to apply log10 transform before scaling.
+    eps : float
+        Small positive shift for log safety.
+    """
+
+    def __init__(self, cluster_config, log_cols=None, eps=1e-12):
+        self.cluster_config = cluster_config
+        self.log_cols = log_cols if log_cols is not None else []
+        self.eps = eps
+
+        # fitted objects
+        self.shifts = {}        # shifts for log cols
+        self.gmms = {}          # fitted GMMs
+        self.scalers = {}       # scalers per col (or per cluster)
+        self.col_order = None   # to reconstruct inverse transform
+        self.max_points = 100000
+
+    def fit(self, X, y=None):
+        X = X.copy()
+        self.shifts = {}
+        self.scalers = {}
+
+        # Loop over all columns
+        for col in X.columns:
+            x = X[col].values.reshape(-1, 1)
+            
+
+
+            # --- apply log shift if needed ---
+            if col in self.log_cols:
+                print(f"Applying log shift for {col}")
+                min_val = x.min()
+                shift = 0.0
+                if min_val <= 0:
+                    shift = abs(min_val) + self.eps
+                self.shifts[col] = shift
+                x = np.log10(x + shift)
+
+            # --- cluster-aware scaling ---
+            if col in self.cluster_config.keys():
+                print(f"Fitting GMM for {col}")
+                n_clusters = self.cluster_config[col]
+
+                if n_clusters > 1:
+
+                    if self.max_points and len(x) > self.max_points:
+                        idx = np.random.choice(len(x), self.max_points, replace=False)
+                        x_fit = x[idx].reshape(-1, 1)
+                    else:
+                        x_fit = x
+
+                    gmm = GaussianMixture(n_components=n_clusters, covariance_type="diag", random_state=42)
+                    gmm.fit(x_fit)
+                    self.gmms[col] = gmm
+
+                    cluster_assignments = gmm.predict(x)
+
+                    # only keep clusters with enough samples
+                    min_samples = 5
+                    valid_clusters = [
+                        c for c in range(n_clusters)
+                        if np.sum(cluster_assignments == c) >= min_samples
+                    ]
+                    self.scalers[col] = {
+                        c: StandardScaler().fit(x[cluster_assignments == c])
+                        for c in valid_clusters
+                    }
+                    self.scalers[col][col] = StandardScaler().fit(x)  # fallback scaler
+            else:
+                print(f"Fitting StandardScaler for {col}")
+                self.scalers[col] = StandardScaler().fit(x)
+
+        self.col_order = list(X.columns.tolist())
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        X_out = pd.DataFrame(columns=X.columns)
+
+        for col in X.columns:
+            x = X[col].values.reshape(-1, 1)
+
+            # --- log transform if needed ---
+            if col in self.log_cols:
+                shift = self.shifts.get(col, 0.0)
+                x = np.log10(x + shift)
+
+            if col in self.cluster_config.keys():
+                n_clusters = self.cluster_config[col]
+                if n_clusters > 1:
+                    gmm = self.gmms[col]
+                    cluster_assignments = gmm.predict(x)
+
+                    # one-hot encode clusters
+                    cluster_ids = pd.get_dummies(cluster_assignments, prefix=f"{col}_cluster")
+                    cluster_ids = cluster_ids.astype(int)
+                    for i in range(n_clusters):
+                        cname = f"{col}_cluster_{i}"
+                        if cname not in cluster_ids:
+                            cluster_ids[cname] = 0
+                    X_out = pd.concat([X_out, cluster_ids], axis=1)
+
+                    # residuals
+                    residuals = np.zeros_like(x, dtype=float)
+                    for c in range(n_clusters):
+                        idx = cluster_assignments == c
+                        if np.any(idx):
+                            residuals[idx] = self.scalers[col][c].transform(x[idx])
+                    X_out[f"{col}_resid"] = residuals.flatten()
+
+                    X_out[col] = self.scalers[col][col].transform(x).flatten()
+
+            else:
+                X_out[col] = self.scalers[col].transform(x).flatten()
+
+        return X_out
+
+    def inverse_transform(self, X_proc):
+        X_recon = pd.DataFrame(index=X_proc.index)
+
+        for col, n_clusters in self.cluster_config.items():
+            if n_clusters > 1:
+                cluster_cols = [c for c in X_proc.columns if c.startswith(f"{col}_cluster")]
+                cluster_ids = X_proc[cluster_cols].values.argmax(axis=1)
+                residuals = X_proc[f"{col}_resid"].values.reshape(-1, 1)
+
+                x_recon = np.zeros_like(residuals)
+                for c in range(n_clusters):
+                    idx = cluster_ids == c
+                    if np.any(idx):
+                        x_recon[idx] = self.scalers[col][c].inverse_transform(residuals[idx])
+                x = x_recon
+
+            else:
+                x = self.scalers[col].inverse_transform(X_proc[[col]].values)
+
+            # inverse log if applied
+            if col in self.log_cols:
+                shift = self.shifts.get(col, 0.0)
+                x = np.power(10, x) - shift
+
+            X_recon[col] = x.flatten()
+
+        return X_recon
+
+
+
+def build_neuralnet(hp,input_shape,output_shape,loss_fn):
+    model = tf.keras.Sequential()
+    # First hidden layer
+    model.add(tf.keras.layers.Dense(
+        units=hp.Int('units1', min_value=32, max_value=2*256, step=32),
+        activation='relu',
+        input_shape=(input_shape,)
+    ))
+    model.add(tf.keras.layers.BatchNormalization())
+    model.add(tf.keras.layers.Dropout(hp.Float('dropout1', 0.0, 0.5, step=0.1)))
+    # Second hidden layer
+    model.add(tf.keras.layers.Dense(
+        units=hp.Int('units2', min_value=32, max_value=2*256, step=32),
+        activation='relu'
+    ))
+    model.add(tf.keras.layers.BatchNormalization())
+    model.add(tf.keras.layers.Dropout(hp.Float('dropout2', 0.0, 0.5, step=0.1)))
+    # Third hidden layer
+    model.add(tf.keras.layers.Dense(
+        units=hp.Int('units3', min_value=32, max_value=2*256, step=32),
+        activation='relu'
+    ))
+    model.add(tf.keras.layers.BatchNormalization())
+    model.add(tf.keras.layers.Dropout(hp.Float('dropout3', 0.0, 0.5, step=0.1)))
+    # Output layer
+    model.add(tf.keras.layers.Dense(output_shape))
+    # Compile
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(
+            hp.Float('lr', 1e-5, 1e-2, sampling='log')
+        ),
+        loss=loss_fn,
+        metrics=['mae','mse']
+    )
+    return model
+
+def instantiate_tuner(input_shape, output_shape, loss_fn):
     tuner = kt.BayesianOptimization(
-        build_model,
+        lambda hp: build_neuralnet(hp, input_shape=input_shape, output_shape=output_shape, loss_fn=loss_fn),
         objective='val_loss',
         max_trials=20,
         directory='tuning_dir',
         project_name='nnet_tuning',
     )
+    return tuner
+
+def hyper_parameter_tuning(X, y, sample_size, tuner):
+    # Randomly sample a subset of the data for tuning
+    idxs = np.random.choice(np.arange(X.shape[0]), size=sample_size, replace=False)
+    X = X.sample(n=sample_size, random_state=42)
+    assert X.shape[0] == sample_size
+    y = y.loc[X.index]
+    assert y.shape[0] == sample_size
+    # assert no nans
+    # get the sum of null values
+    badcols = X.isnull().sum().sort_values()
+    
+    assert not X.isnull().values.any(), X[badcols[badcols>0].index]
+    assert not y.isnull().values.any()
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     early_stop = EarlyStopping(patience=10, restore_best_weights=True)
 
@@ -1375,12 +1641,14 @@ def hyper_parameter_tuning(X, y, sample_size, loss_fn="mse"):
         X_train, y_train,
         validation_data=(X_test,y_test),
         epochs=100,
-        batch_size=512,
+        batch_size=256 * 16,
         callbacks=[early_stop]
     )
     
     best_model = tuner.get_best_models(num_models=1)[0]
     return best_model
+
+
 
 # create a surrogate Class
 class SurrogateModel:
@@ -1394,7 +1662,7 @@ class SurrogateModel:
         self.model = model
         self.scaler = scalers
 
-    def predict(self, X, apply_scale_to_X=True):
+    def predict(self, X, apply_scale_to_X=True, batch_size=256):
         X = X.copy()
         if isinstance(X, pd.DataFrame):
             try:
@@ -1404,7 +1672,7 @@ class SurrogateModel:
         if apply_scale_to_X:
             if "X" in self.scaler.keys() and self.scaler["X"] is not None:
                 X = self.scaler["X"].transform(X)
-        pred = self.model.predict(X)
+        pred = self.model.predict(X,batch_size=batch_size)
         if "y" in self.scaler.keys():
             pred = self.scaler["y"].inverse_transform(pred)
         return pred
@@ -1439,33 +1707,37 @@ def plot_y_vs_yhat(columns,result_dict):
         for e,col in enumerate(columns):
             print(col)
 
-            fig,ax = plt.subplots(1,1,figsize=(4,4))
+            fig,axs = plt.subplots(1,2,figsize=(8,4),sharex=True,sharey=True)
 
-            for key in result_dict.keys():
-                y = result_dict[key]['y'][:,e]
-                yhat = result_dict[key]['yhat'][:,e]
-                ax.scatter(y, yhat, label=key,
-                           alpha=0.3,
-                           c=marker_dict[key]['color'],
-                           marker=marker_dict[key]['marker'])
+            for e,key in enumerate(result_dict.keys()):
+                ax= axs[e]
+                y = result_dict[key]['y'].loc[:,col]
+                yhat = result_dict[key]['yhat'].loc[:,col]
+                #ax.scatter(y, yhat, label=key,
+                #           alpha=0.3,
+                #           c=marker_dict[key]['color'],
+                #           marker=marker_dict[key]['marker'])
+                hx = ax.hexbin(y, yhat, gridsize=200,mincnt=1, cmap='viridis',bins='log')
+                cb = fig.colorbar(hx, ax=ax, shrink=0.5,label='log10(count)')
 
-            ax.set_title(col)
-            ax.set_xlabel('Actual')
-            ax.set_ylabel('Predicted')
-            ax.legend()
+                ax.set_title(f"{col} - {key}")
+                ax.set_xlabel('Actual')
+                ax.set_ylabel('Predicted')
+                #ax.legend()
 
-            # set y and x limits to same values
-            lims = ax.get_xlim()
-            lims2 = ax.get_ylim()
-            xmax = max(lims[1], lims2[1])
-            xmin = min(lims[0], lims2[0])
-            ax.set_xlim([xmin, xmax])
-            ax.set_ylim([xmin, xmax])
-            ax.plot([xmin, xmax], [xmin, xmax], 'k--')
-            ax.set_aspect('equal')
+                # set y and x limits to same values
+                lims = ax.get_xlim()
+                lims2 = ax.get_ylim()
+                xmax = max(lims[1], lims2[1])
+                xmin = min(lims[0], lims2[0])
+                ax.plot([xmin, xmax], [xmin, xmax], 'k--')
+                ax.set_xlim([xmin, xmax])
+                ax.set_ylim([xmin, xmax])
+                
+                ax.set_aspect('equal')
             fig.tight_layout()
             pdf.savefig(fig,dpi=90)
-            plt.show()
+            #plt.show()
 
             
 
@@ -1504,18 +1776,23 @@ class PhysicsInformedLoss(tf.keras.losses.Loss):
 
     def __init__(self, 
                  cols,
+                 non_zero_columns,
                  element_balances,
                  redox_couples,
                  charges,
+                 scaler,
                  weights=None,
                  eps=1e-12,
                  name="PhysicsInformedLoss"):
         super().__init__(name=name)
         self.cols = cols
+        self.non_zero_columns = non_zero_columns
+        self.non_zero_columns_idxs = [self.cols.index(col) for col in non_zero_columns]
         self.element_balances = element_balances
         self.redox_couples = redox_couples
         self.charges = charges
         self.eps = eps
+        self.scaler = scaler
 
         default_weights = {"mse": 1.0, "nonneg": 0.1, "mass": 0.5, "charge": 0.5, "redox": 0.3}
         self.weights = weights if weights is not None else default_weights
@@ -1569,28 +1846,86 @@ class PhysicsInformedLoss(tf.keras.losses.Loss):
     # Call method
     # -------------------
     def call(self, y_true, y_pred):
+
+        # MSE in transformed space
         mse = tf.reduce_mean(tf.square(y_true - y_pred))
-        nonneg = tf.reduce_mean(tf.square(tf.nn.relu(-y_pred)))
-        mass = self.mass_balance_penalty(y_pred)
-        charge = self.charge_balance_penalty(y_pred)
-        redox = self.redox_penalty(y_pred)
+
+        # physics based metrics in original space; inverse transform first
+        y_pred_orig = self.scaler.inverse_transform(y_pred.numpy())
+        # assert no nans
+        assert not np.isnan(y_pred_orig).any(), "NaNs in inverse transformed predictions"
+        nonneg = tf.reduce_mean(tf.square(tf.nn.relu(-y_pred_orig[:, self.non_zero_columns_idxs])))
+        assert not np.isnan(nonneg.numpy()), "NaNs in non-negativity penalty"
+        mass = self.mass_balance_penalty(y_pred_orig)
+        assert not np.isnan(mass.numpy()), "NaNs in mass balance penalty"
+        charge = self.charge_balance_penalty(y_pred_orig)
+        assert not np.isnan(charge.numpy()), "NaNs in charge balance penalty"
+
+        #TODO: something wrong with redox function
+        #redox = self.redox_penalty(y_pred_orig)
+        #assert not np.isnan(redox.numpy()), "NaNs in redox penalty"
 
         total_loss = (self.weights["mse"] * mse +
                       self.weights["nonneg"] * nonneg +
                       self.weights["mass"] * mass +
-                      self.weights["charge"] * charge +
-                      self.weights["redox"] * redox)
+                      self.weights["charge"] * charge 
+                      #+ self.weights["redox"] * redox
+                      )
+        assert not np.isnan(total_loss.numpy()), "NaNs in total loss"
         return total_loss
 
 
 
-def surrogate_workflow():
+def surrogate_workflow(hyperparameter_tuning=True):
 
-    X,y = get_trainingdata()
+    # data etl
+    data_fpath = os.path.join(".",'dataframe.pkl')
+    if os.path.exists(data_fpath):
+        df = pd.read_pickle(data_fpath)
+    else:
+        df = get_trainingdata()
+        df.to_pickle( os.path.join(".",'dataframe.pkl') )
+    
+    X = df['features'].drop(columns=['time','cell'])
+    y = df['targets'].drop(columns=['time','cell'])
 
+
+
+    # split and fit scaler
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # specify log cols
+    log_cols = X.columns.tolist()
+    remove_cols = ["ph","tmp","pe","sturation",]
+    log_cols = X.loc[:,~X.columns.str.lower().str.contains('|'.join(remove_cols))].columns.tolist()
+    #for c in remove_cols:
+    #    log_cols = log_cols[~log_cols.str.lower().str.contains(c)]
+    #log_cols = X.columns[(X > 0).all(axis=0)].tolist()
+    #X_scaler = LogStandardScaler(log_cols=log_cols)
+    cluster_config = {
+                    "pe": 5,
+                    "EQUI_Orgmatter": 5,
+                    "MOL_CaX2": 5,
+                    "MOL_FeX2": 5,
+                    "MOL_KX": 5,
+                    "MOL_MgX2": 5,
+                    "KIN_Pyrite": 5,
+                }
+    X_scaler = ClusterLogScaler(log_cols=log_cols,
+                                cluster_config=cluster_config
+                                )
+    X_train = X_scaler.fit_transform(X_train)
+    X_test = X_scaler.transform(X_test)
+    #log_cols = y.columns[(y > 0).all(axis=0)].tolist()
+    y_scaler = LogStandardScaler(log_cols=log_cols)
+    #y_scaler = ClusterLogScaler(log_cols=log_cols,
+    #                            cluster_config=cluster_config
+    #                            )
+    y_train = y_scaler.fit_transform(y_train)
+    y_test = y_scaler.transform(y_test)
 
     # Columns from your DataFrame
-    cols = y.drop(columns=["time", "cell"]).columns.tolist()
+    cols = y.columns.tolist()
 
     # Element balances
     ELEMENT_BALANCES = {
@@ -1615,45 +1950,56 @@ def surrogate_workflow():
         "S_2": -2, "SO4": -2
     }
 
+    # get all column names that do not contain <= 0
+    non_zero_columns = X.columns[(X > 0).any(axis=0)]
+
     # Instantiate loss
     loss_fn = PhysicsInformedLoss(
         cols=cols,
+        non_zero_columns=non_zero_columns,
+        scaler=y_scaler,
         element_balances=ELEMENT_BALANCES,
         redox_couples=REDOX_COUPLES,
         charges=CHARGES   
     )
     
-    #loss_fn = "mse"
-
-
-
-    m = hyper_parameter_tuning(X,
-                               y,
-                               sample_size=100000,
-                               loss_fn=loss_fn
-                               )
-
-    X_train, X_test, X_scaler, y_train, y_test, y_scaler = preprocess_data(X, y)
     
-    m.fit(X_train, y_train,
-          #loss_fn=loss_fn,
-          epochs=100,
-          validation_data=(X_test, y_test),
-          batch_size=512,
-          callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
-          verbose=1)
+    
+    loss_fn = "mse"
+
+    tuner = instantiate_tuner(input_shape=X_train.shape[1],
+                              output_shape=y_train.shape[1],
+                              loss_fn=loss_fn)
+    if hyperparameter_tuning:
+        m = hyper_parameter_tuning(X_train,
+                                y_train,
+                                sample_size=100000,
+                                tuner=tuner
+                                )
+    else:
+        m = tuner.get_best_models(num_models=1)[0]
+
+    
+    
+#   m.fit(X_train, y_train,
+#         #loss_fn=loss_fn,
+#         epochs=100,
+#         validation_data=(X_test, y_test),
+#         batch_size=256,
+#         callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+#         verbose=1)
     
     s = SurrogateModel(m, {"X": X_scaler, "y": y_scaler})
 
     s.save('surrogate_model.pkl')
-
-    yhat_train = s.predict(X_train, apply_scale_to_X=False)
-    yhat_test = s.predict(X_test, apply_scale_to_X=False)
+    batch_size = 2048 * 4
+    yhat_train = s.predict(X_train, apply_scale_to_X=False,batch_size=batch_size)
+    yhat_test = s.predict(X_test, apply_scale_to_X=False,batch_size=batch_size)
     result_dict={
                 "train":{"y":y_scaler.inverse_transform(y_train), "yhat":yhat_train},
                 "test":{"y":y_scaler.inverse_transform(y_test), "yhat":yhat_test}
                 }
-    columns = y.drop(columns=['time','cell']).columns.tolist()
+    columns = y.columns.tolist()
     plot_y_vs_yhat(columns,result_dict)
 
     return
