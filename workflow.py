@@ -1878,7 +1878,7 @@ class PhysicsInformedLoss(tf.keras.losses.Loss):
 
 
 
-def surrogate_workflow(hyperparameter_tuning=True):
+def surrogate_workflow(hyperparameter_tuning=False):
 
     # data etl
     data_fpath = os.path.join(".",'dataframe.pkl')
@@ -1993,7 +1993,7 @@ def surrogate_workflow(hyperparameter_tuning=True):
           #loss_fn=loss_fn,
           epochs=100,
           validation_data=(X_test, y_test),
-          batch_size=256*8,
+          batch_size=256*16,
           callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
           verbose=1)
     
