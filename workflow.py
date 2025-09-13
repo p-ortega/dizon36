@@ -5,10 +5,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import flopy
 import pyemu
+import geopandas as gpd
+import platform
+import shapefile as sf
 from mf6rtm import utils, mup3d
 from collections import defaultdict
 from flopy.utils.gridintersect import GridIntersect
 from collections.abc import Iterable
+from pypestutils.pestutilslib import PestUtilsLib
+lib = PestUtilsLib()
 
 datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
@@ -25,7 +30,284 @@ perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
             (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
             (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
 
+def get_avg_distance(points, npoints=10):
+    """
+    Calculate the average distance to the nearest n points for each point in a set of points.
 
+    Parameters
+    ----------
+    points : numpy array
+        Array of points.
+    npoints : int
+        Number of nearest points to calculate the average distance to.
+    Returns
+    -------
+    average_distances : numpy array
+        Array of average distances to the nearest n points for each point in the input array.
+    """
+
+    from scipy.spatial import distance
+    distances = distance.cdist(points, points, 'euclidean')
+    np.fill_diagonal(distances, np.inf)
+    nearest_n = np.partition(distances, npoints, axis=1)[:, :npoints]
+    average_distances = np.mean(nearest_n, axis=1)
+    return average_distances
+
+def interpolate_property_to_grid(gwf, ws, property_array, property_name="k"):
+    """
+    Interpolate a 3D property array (shape: nlay, nrow, ncol) onto the grid using kriging.
+    """
+    bps = gpd.read_file(os.path.join(datadir, 'botm.shp'))
+    bps['x'] = bps.geometry.centroid.x
+    bps['y'] = bps.geometry.centroid.y
+
+    ppeasting = bps.x.values
+    ppnorthing = bps.y.values
+    anis = 1
+    bearing = 0.0
+    aa = 1.5 * get_avg_distance(bps[['x','y']].values, 10).max()
+
+    easting = gwf.modelgrid.xcellcenters.flatten()
+    northing = gwf.modelgrid.ycellcenters.flatten()
+    max_pts = 50
+    min_pts = 1
+    search_dist = 1.e+10
+    aa_pp = aa
+    zone_pp = np.ones_like(ppeasting, dtype=int)
+    fac_file = os.path.join(ws, f"factors.bin")
+
+    ib = np.ones_like(easting, dtype=int)
+    ipts = lib.calc_kriging_factors_2d(
+        ppeasting, ppnorthing, zone_pp,
+        easting, northing, ib.flatten(),
+        "exp", "ordinary",
+        aa_pp, anis, bearing, search_dist, max_pts, min_pts, fac_file, "binary"
+    )
+
+    nlay = gwf.dis.nlay.get_data()
+    nrow = gwf.dis.nrow.get_data()
+    ncol = gwf.dis.ncol.get_data()
+    icpls = nrow * ncol
+
+    interpolated = []
+    for layer in range(nlay):
+        # Flatten the property array for this layer
+        ppval = property_array[layer].flatten()
+        result = lib.krige_using_file(
+            fac_file, "binary", icpls, "ordinary", "log",
+            np.array(ppval), np.zeros_like(icpls), 0
+        )
+        # check if result['targval'] has negative values
+        if np.any(result['targval'] < 0):
+            print(f"Negative values found in result['targval'] for prop {property_name} layer {layer+1}")
+        interpolated.append(np.round(result['targval'], 6))
+    # check if inteprolated has negative values
+    interpolated = np.array(interpolated).reshape((nlay, nrow, ncol))
+    if np.any(interpolated < 0):
+        print(f"Negative values found in interpolated array for prop {property_name}")
+        raise ValueError("Interpolated values contain negative values.")
+    return np.array(interpolated)
+
+
+def get_properties_from_og(ws, gwf, prop = ['k', 'ss', 'sy']):
+    sim_og = flopy.mf6.MFSimulation.load(sim_ws = ws,
+                                  sim_name = 'gwf', 
+                                  version='mf6',
+                                    exe_name='mf6',
+                                    verbosity_level=0)
+    gwf_og = sim_og.get_model("gwf")
+    dict_prop = {}
+    for p in prop:
+        # print(p)
+        if p in ['k', 'k33']:
+            # print(f"property: {p} min: {karr.min()} max: {karr.max()}")
+            og_arr = getattr(gwf_og.npf, p).get_data()
+        if p in ['ss', 'sy']:
+            og_arr = getattr(gwf_og.sto, p).get_data()
+            # print(f"property: {p} min: {sarr.min()} max: {sarr.max()}")
+        prop_arr = interpolate_property_to_grid(gwf, ws, og_arr, p)
+        dict_prop[p] = prop_arr
+
+    return dict_prop
+
+def get_botms(gwf, ws):
+    bps = gpd.read_file(os.path.join(datadir, 'botm.shp'))
+    bps['x'] = bps.geometry.centroid.x
+    bps['y'] = bps.geometry.centroid.y
+    bps
+
+    ppeasting = bps.x.values
+    ppnorthing = bps.y.values
+    anis = 1
+    bearing= 0.0
+    aa = 1.5 * get_avg_distance(bps[['x','y']].values, 2).max()
+
+    ib = gwf.dis.idomain.get_data()
+    # cellids = df.loc[df.layer==layer+1].icpl.values - 1 # zero-based
+    easting = gwf.modelgrid.xcellcenters.flatten()
+    northing = gwf.modelgrid.ycellcenters.flatten()
+
+    max_pts = 50 # pp are same as cell centers, so kind of irrelevant
+    min_pts = 1
+    search_dist = 1.e+10
+    aa_pp = aa #?
+    zone_pp = np.ones_like(ppeasting,dtype=int)
+    fac_file = os.path.join(ws,f"factors.bin")
+
+    ib = np.ones_like(easting,dtype=int)
+    ipts = lib.calc_kriging_factors_2d(ppeasting,
+                                    ppnorthing,
+                                    zone_pp,
+                                    easting,
+                                    northing,
+                                    ib.flatten(),
+                                    "exp","ordinary",
+                                    aa_pp,anis,bearing,search_dist,max_pts,min_pts,fac_file,"binary")
+
+    botms = []
+    icpls = gwf.dis.nrow.get_data() * gwf.dis.ncol.get_data()
+    for layer in range(1, 13):
+        # get COND multiplier
+        ppval = bps[f"botm_{layer}"].values
+        result = lib.krige_using_file(os.path.join(ws,f"factors.bin"),
+                                        "binary",
+                                        icpls,
+                                        "ordinary",
+                                        "none",
+                                        np.array(ppval),
+                                        np.zeros_like(icpls),
+                                        0)
+        botms.append(np.round(result['targval'], 1))
+    return botms
+
+def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
+
+    nper = 39  # Number of stress periods
+
+    perioddata= [(2, 2, 1), (4, 4, 1), (4, 4, 1), (4, 4, 1), (7, 7, 1),
+                (7, 7, 1), (7, 7, 1), (7, 7, 1), (14, 14, 1), (14, 14, 1), 
+                (15, 15, 1), (13, 13, 1), (14, 14, 1), (14, 14, 1), (14, 14, 1), 
+                (21, 21, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (35, 35, 1), (35, 35, 1), (28, 28, 1), (28, 28, 1), (28, 28, 1), 
+                (28, 28, 1), (35, 35, 1), (35, 35, 1),(28, 28, 1)]
+
+    # specify the mf6 gw object & add relevant components
+    sim = flopy.mf6.MFSimulation(sim_name=model_name, version='mf6', sim_ws='.')
+    sim.set_sim_path(ws)
+
+    # specify tdis
+    tdis = flopy.mf6.ModflowTdis(sim, pname="tdis", time_units="DAYS", 
+                                 nper=nper, perioddata=perioddata)
+    outer_dvclose = 1e-7
+    inner_dvclose = 1e-7
+    ims = flopy.mf6.ModflowIms(sim, 
+                            #    pname="ims", 
+                            complexity="complex",
+                            outer_dvclose=outer_dvclose,
+                            inner_dvclose=inner_dvclose,
+                            filename=f"{model_name}.ims")
+    sim.register_ims_package(ims, 
+                             [model_name])
+    
+    # start model build to refine 
+    model_nam_file = "{}.nam".format(model_name)
+    gwf = flopy.mf6.ModflowGwf(sim, modelname=model_name, 
+                               model_nam_file=model_nam_file, exe_name='mf6')
+
+    length_units = "METERS"
+
+    domain = gpd.read_file(os.path.join(datadir, 'modeldis.shp'))
+    Ly = domain.geometry.total_bounds[3] - domain.geometry.total_bounds[1]
+    Lx = domain.geometry.total_bounds[2] - domain.geometry.total_bounds[0]
+
+    xul = domain.geometry.total_bounds[0]
+    yul = domain.geometry.total_bounds[1]
+
+    dis = make_dis_structured(gwf, Ly=Lx, Lx=Ly, xul=xul, yul=yul)
+    botms = get_botms(gwf, ws)
+    dis.botm.set_data(botms)
+    dis.set_all_data_external()
+
+    nlay = dis.nlay.get_data()
+    nrow = dis.nrow.get_data()
+    ncol = dis.ncol.get_data()
+
+    # dis.idomain.export(os.path.join("output", "dis_botm.vtk"), fmt="vtk")
+    dict_prop = get_properties_from_og(ws=os.path.join("model", "reactive_demo"),
+                            gwf=gwf, prop = ['k', 'k33', 'ss', 'sy'])
+
+    ihead = 0 #(meters)
+    strt = ihead * np.ones((nlay, nrow, ncol))
+    ic = flopy.mf6.ModflowGwfic(gwf, pname="ic", strt=strt)
+    ic.set_all_data_external()
+
+    npf = flopy.mf6.ModflowGwfnpf(
+        gwf,
+        icelltype=0,
+        k=dict_prop['k'],
+        k33=dict_prop['k33'],
+        # k33overk = True
+    )
+    npf.set_all_data_external()
+    ss = np.ones((nlay, nrow, ncol)) * 1.e-4
+    sto = flopy.mf6.ModflowGwfsto(gwf, 
+                                  ss=dict_prop['ss'], 
+                                  iconvert=0,
+                                    # steady_state={0: False},
+                                    transient={0: True})
+    sto.set_all_data_external()
+
+    chd = make_chd(gwf, one_compound=tracer, mup3d_m=mup3d_m)
+
+    wel_out = make_wel_out(gwf, nper =39, one_compound=tracer, mup3d_m=mup3d_m, from_shp=True)
+    # # make wel in
+    wel_in = make_wel_in(gwf, nper =39, 
+                        one_compound=tracer, mup3d_m=mup3d_m, from_shp=True)
+
+    # create the output control
+    headfile = f"{model_name}.hds"
+    head_filerecord = [headfile]
+    budgetfile = f"{model_name}.cbb"
+    budget_filerecord = [budgetfile]
+    saverecord = [("HEAD", "ALL"), ("BUDGET", "ALL")]
+    printrecord = [("HEAD", "LAST")]
+    
+    oc = flopy.mf6.ModflowGwfoc(
+        gwf,
+        saverecord=saverecord,
+        head_filerecord=head_filerecord,
+        budget_filerecord=budget_filerecord,
+        printrecord=printrecord,)
+    sim.write_simulation()
+    return sim
+
+
+def make_dis_structured(gwf, Ly=10, Lx=10, xul=0, yul=0):
+    # Define model parameters for the dummy model
+    del_ = 8  # Grid spacing
+    nrow = int(Lx / del_)+1
+    ncol = int(Ly / del_)+1
+    nlay = 12  # Number of layers
+    ib = np.ones((nlay, nrow, ncol))
+
+    top = -273  # Top elevation (constant, meters above mean sea level)
+    botm = np.zeros((nlay, nrow, ncol))  # Bottom elevations of each layer (meters)
+    dis = flopy.mf6.ModflowGwfdis(
+        gwf,
+        nlay=nlay,
+        nrow=nrow,
+        ncol=ncol,
+        delr=del_,
+        delc=del_,
+        top=top,
+        idomain=ib,
+        botm=botm,
+        xorigin=xul,
+        yorigin=yul
+    )
+    return dis
 # def copy_gwt_model_files_from_parent(ws=".", parent_model_dir = 'gwtbenzene',
 #                                      dsp_par =  ['alh', 'ath1', 'atv'], 
 #                                  ist_par = ['porosity', 'zetaim', 'volfrac', 'bulk_density'],
@@ -479,23 +761,53 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.initialize(add_charge_flag=True)
     return model
 
-def make_wel_in(gwf, one_compound = None, mup3d_m=None, nper=39):
-    coords_in = [
-        (1, 9, 38),
-        (2, 9, 38),
-        (3, 9, 38),
-        (5, 9, 38),
-        (7, 9, 38),
-    ]
-    layers_inj = [i[0] for i in coords_in]
+def get_wel_coords(gwf, name  = "wellin"):
+    mg = gwf.modelgrid
+    ix = GridIntersect(mg)
+    wells = pd.read_csv(os.path.join(datadir, "wells.csv"))
+    wells = gpd.GeoDataFrame(wells, geometry=gpd.points_from_xy(wells.x, wells.y))
 
+    assert name in wells.name.values, f"{name} not in well"
+    wells = wells[wells.name == name]
+    geom = wells.geometry[wells.name==name].values
+
+    assert len(geom)==1, f"more than one well with name {name} in wells.csv"
+    cellid = ix.intersect(geom[0], 'point').cellids
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    mg.plot(ax=ax)
+    ix.plot_point(ix.intersect(geom[0], 'point'), ax=ax)
+    print(cellid[0])
+    return cellid[0]
+
+def make_wel_in(gwf, one_compound = None,
+                mup3d_m=None, nper=39, from_shp=False):
+    layers = [1,2,3,5,7]
+    if from_shp:
+        # coords_in = {}
+        cellid = get_wel_coords(gwf, name  = "wellin")
+        coords_in = {lay: (lay, cellid[0], cellid[1]) for lay in layers}
+
+        print(cellid)
+    else:
+        coords_in = [
+            (1, 9, 38),
+            (2, 9, 38),
+            (3, 9, 38),
+            (5, 9, 38),
+            (7, 9, 38),
+        ]
     df_inj = pd.read_csv(os.path.join(datadir, "wellin.csv"))
     wellin_sp_data = defaultdict(list)
 
     if one_compound is not None:
         assert one_compound in df_inj.columns, print("compound not in wellin csv")
+        #get all unique cells
         for _, r in df_inj.iterrows():
-            cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
+            if from_shp:
+                layer = int(r["layer"])
+                cell = coords_in[layer]  # zero‑indexed
+            else:
+                cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
             wellin_sp_data[int(r["kper"])].append([cell, r["rate"], r[f"{one_compound}"]])
         wel_in  = flopy.mf6.ModflowGwfwel(gwf, 
                                        stress_period_data=wellin_sp_data,
@@ -515,11 +827,15 @@ def make_wel_in(gwf, one_compound = None, mup3d_m=None, nper=39):
             wel_chem_dir[per] = wellchem.data
 
         for _, r in df_inj.iterrows():
-            cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
+            if from_shp:
+                layer = int(r["layer"])
+                cell = coords_in[layer]  # zero‑indexed
+            else:
+                cell = (int(r["layer"]), int(r["row"]), int(r["column"]))  # zero‑indexed
             wellin_sp_data[int(r["kper"])].append([cell, r["rate"]])
 
         for per in range(nper):
-            for e, layer in  enumerate(layers_inj):
+            for e, layer in  enumerate(layers):
                 chem_arr = wel_chem_dir[per][e]
                 wellin_sp_data[per][e].extend(chem_arr)
         wel_in  = flopy.mf6.ModflowGwfwel(gwf, 
@@ -530,13 +846,20 @@ def make_wel_in(gwf, one_compound = None, mup3d_m=None, nper=39):
         wel_in.set_all_data_external()
         return wel_in
 
-def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39):
 
-    coords_out = [ # (row, col, layer) 
-        (1, 9,  9),
-        (3, 9,  9),
-        (5, 9,  9),
-    ]
+def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39, from_shp=False):
+
+    if from_shp:
+        layers = [1,3,5]
+        cellid = get_wel_coords(gwf, name  = "wellout")
+        coords_out = [(lay, cellid[0], cellid[1]) for lay in layers]
+        print(coords_out)
+    else:
+        coords_out = [ # (row, col, layer) 
+            (1, 9,  9),
+            (3, 9,  9),
+            (5, 9,  9),
+        ]
     init_rates_out  = [-300,  -30,  -30]                # 3 negatives
     fini_rates_out  = [-400,  -40,  -40]
 
@@ -554,9 +877,16 @@ def make_wel_out(gwf, one_compound = None, mup3d_m=None, nper=39):
         ]
 
     # Time‑invariant blocks for each phase
-    wellout_init  = make_rows(coords_out, init_rates_out)
-    wellout_fini  = make_rows(coords_out, fini_rates_out, add_conc=True)
-    wellout_sp_data = {sp: (wellout_init if sp in init_sp else wellout_fini)
+    if from_shp:
+        wellout_init = {sp: make_rows(coords_out, init_rates_out) for sp in all_sp}
+        wellout_fini = {sp: make_rows(coords_out, fini_rates_out, add_conc=True) 
+                        for sp in all_sp}
+        wellout_sp_data = {sp: (wellout_init[sp] if sp in init_sp else wellout_fini[sp])
+                    for sp in all_sp}
+    else:
+        wellout_init  = make_rows(coords_out, init_rates_out)
+        wellout_fini  = make_rows(coords_out, fini_rates_out, add_conc=True)
+        wellout_sp_data = {sp: (wellout_init if sp in init_sp else wellout_fini)
                     for sp in all_sp}
 
     if one_compound is not None:
@@ -1107,10 +1437,6 @@ def setup_pest(org_d, num_reals=50,
     ib = gwf.dis.idomain.get_data()
     ib[ib<1] = 0
 
-    # sr = pyemu.helpers.SpatialReference.from_namfile(
-    #         os.path.join(tmp_d, "gwf.nam"),
-    #         delr=gwf.dis.delr.array, delc=gwf.dis.delc.array)
-
     pf = pyemu.utils.PstFrom(original_d=tmp_d, 
                                 new_d=template_ws,
                                 remove_existing=True, 
@@ -1133,9 +1459,9 @@ def setup_pest(org_d, num_reals=50,
                             use_cols=['sim'], 
                             prefix=f"hm") 
     pp_v = pyemu.geostats.ExpVario(contribution=1,
-                                   a=25,
-                                   anisotropy=1,
-                                   bearing=0.0)
+                                   a=100,
+                                   anisotropy=3,
+                                   bearing=45.0)
     pp_gs = pyemu.geostats.GeoStruct(variograms=pp_v, transform='log')
 
     tag_list = ["npf_k_", 
@@ -1174,7 +1500,7 @@ def setup_pest(org_d, num_reals=50,
                                 lower_bound=lb,
                                 # ult_ubound=uub,
                                 # ult_lbound=ulb,
-                                pp_options={"pp_space":2,
+                                pp_options={"pp_space":5,
                                             "prep_hyperpars":False},
                                 geostruct=pp_gs,
                                 apply_order=2
@@ -1182,7 +1508,7 @@ def setup_pest(org_d, num_reals=50,
             pf.add_parameters(f, 
                                 zone_array=ib[layer],
                                 par_type="zone",
-                                geostruct=pp_gs,
+                                # geostruct=pp_gs,
                                 par_name_base="cn."+base,
                                 par_style='m',
                                 pargp="cn."+base,
@@ -1272,7 +1598,7 @@ def set_obsval_and_weights(casename="dizon36",
     pst.write(os.path.join(template_ws, f"{casename}.pst"), version=2)
     return pst
 
-def main(prep_obs = True, run_base = True, 
+def main(prep_obs = True, run_base = True, run_base_struct = False,
          prep_pest = False, run_pest = False):
 
     if prep_obs:
@@ -1281,7 +1607,7 @@ def main(prep_obs = True, run_base = True,
                     output_path="obs_chem_cleaned.csv")
     
     if run_base:
-        ws = prep_model_dir(name='reactive')
+        ws = prep_model_dir(name='reactive_demo')
         nlay = 12
         nrow = 10
         ncol = 51
@@ -1291,6 +1617,19 @@ def main(prep_obs = True, run_base = True,
         sim = make_gwf(ws, tracer=tracer,mup3d_m=mup3d_m)
         sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
 
+        pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+    if run_base_struct:
+        ws = prep_model_dir(name='test')
+        sim = make_gwf_structured(ws, tracer='Cl',mup3d_m=None)
+        # pyemu.os_utils.run('mf6', cwd=sim.sim_path)
+        gwf=sim.get_model("gwf")
+        nlay = gwf.dis.nlay.get_data()
+        nrow = gwf.dis.nrow.get_data()
+        ncol = gwf.dis.ncol.get_data()
+        mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
+        tracer = None
+        sim = make_gwf_structured(ws, tracer=tracer,mup3d_m=mup3d_m)
+        sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
         pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     if prep_pest:
         template_ws=os.path.join('pest','pst_template')
@@ -1311,6 +1650,7 @@ if __name__ == "__main__":
     main(
         prep_obs = False,
         run_base = True,
+        run_base_struct = False,
         prep_pest = False,
         run_pest = False
     )
