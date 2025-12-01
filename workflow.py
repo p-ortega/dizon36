@@ -1459,21 +1459,21 @@ def setup_pest(org_d, num_reals=50,
                             use_cols=['sim'], 
                             prefix=f"hm") 
     pp_v = pyemu.geostats.ExpVario(contribution=1,
-                                   a=100,
-                                   anisotropy=3,
-                                   bearing=45.0)
+                                   a=75,
+                                   anisotropy=4,
+                                   bearing=90.0)
     pp_gs = pyemu.geostats.GeoStruct(variograms=pp_v, transform='log')
 
     tag_list = ["npf_k_", 
-                "npf_k33_",
+                # "npf_k33_",
                 "sto_ss_",
                 "kinetic_phases.Pyrite.m0.",
-                "equilibrium_phases.Orgmatter.m0.",
-                "exchange_phases.CaX2.m0",
-                "exchange_phases.FeX2.m0",
-                "exchange_phases.KX.m0",
-                "exchange_phases.MgX2.m0",
-                "exchange_phases.NaX.m0",
+                # "equilibrium_phases.Orgmatter.m0.",
+                # "exchange_phases.CaX2.m0",
+                # "exchange_phases.FeX2.m0",
+                # "exchange_phases.KX.m0",
+                # "exchange_phases.MgX2.m0",
+                # "exchange_phases.NaX.m0",
                 ]
     lb=0.1
     ub=10.0
@@ -1485,29 +1485,30 @@ def setup_pest(org_d, num_reals=50,
         for f in files:
             try:
                 # layer = int(f.split(".")[1].split("_layer")[-1]) -1
-                layer = int(f.split(tag)[1].split('.txt')[0].split("layer")[-1]) -1
+                layer = int(f.split(tag)[1].split('.txt')[0].split("layer")[-1])
             except:
                 layer=0
+            # print(layer)
             base = tag.replace("_",".")+'layer'+str(layer)
             print(base)
             pf.add_parameters(filenames=f,
                                 par_type="pilotpoints",
                                 par_name_base='pp.'+base,
                                 pargp='pp.'+base,
-                                zone_array=ib[layer],
-                                use_pp_zones=True,
+                                # zone_array=ib[layer],
+                                # use_pp_zones=True,
                                 upper_bound=ub,
                                 lower_bound=lb,
                                 # ult_ubound=uub,
                                 # ult_lbound=ulb,
-                                pp_options={"pp_space":5,
+                                pp_options={"pp_space":2,
                                             "prep_hyperpars":False},
                                 geostruct=pp_gs,
-                                apply_order=2
+                                # apply_order=2
                                 )
             pf.add_parameters(f, 
-                                zone_array=ib[layer],
-                                par_type="zone",
+                                # zone_array=ib[layer],
+                                par_type="constant",
                                 # geostruct=pp_gs,
                                 par_name_base="cn."+base,
                                 par_style='m',
@@ -1521,7 +1522,7 @@ def setup_pest(org_d, num_reals=50,
             pf.add_observations(f,
                                 prefix=base,
                                 obsgp=base,
-                                zone_array=ib[layer]
+                                # zone_array=ib[layer]
                                 )
 
     pst = pf.build_pst()
@@ -1534,6 +1535,7 @@ def setup_pest(org_d, num_reals=50,
 
 def run_pestpp(md=f"master", td="pst_template", casename="isr", 
                noptmax=-1,freeze=False,
+               num_reals=100,
                num_workers=10, worker_root=".", 
                pestpp_version="ies",restart=False,
                reuse_master=False, cleanup=True):
@@ -1548,6 +1550,7 @@ def run_pestpp(md=f"master", td="pst_template", casename="isr",
     pst.pestpp_options["ies_subset_size"] = -10 # the more the merrier
     pst.pestpp_options["ies_bad_phi_sigma"] = 2.0
     pst.pestpp_options["panther_agent_freeze_on_fail"] = freeze
+    pst.pestpp_options["ies_num_reals"] = num_reals
 
     pst.write(os.path.join(td, f"{casename}.pst"), version=2)
     # run
@@ -1633,24 +1636,25 @@ def main(prep_obs = True, run_base = True, run_base_struct = False,
         pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     if prep_pest:
         template_ws=os.path.join('pest','pst_template')
-        org_d = os.path.join('model','reactive')
-        setup_pest(org_d, num_reals=15)
+        org_d = os.path.join('model','test')
+        setup_pest(org_d, num_reals=100)
         set_obsval_and_weights()
         add_std_to_pst(fraction=0.05)
         build_noise_ensemble()
     if run_pest:
-        md=os.path.join('pest','master0')
+        md=os.path.join('pest','master1')
         run_pestpp(md=md, td=template_ws, casename="dizon36", 
-                noptmax=-1,freeze=True,
-                num_workers=10, worker_root=".", 
+                noptmax=1,freeze=True,
+                num_reals=50,
+                num_workers=15, worker_root=".", 
                 pestpp_version="ies",restart=False,
                 reuse_master=False, cleanup=True)
 
 if __name__ == "__main__":
     main(
         prep_obs = False,
-        run_base = True,
+        run_base = False,
         run_base_struct = False,
-        prep_pest = False,
-        run_pest = False
+        prep_pest = True,
+        run_pest = True
     )
