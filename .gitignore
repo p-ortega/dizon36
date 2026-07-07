@@ -1,0 +1,7 @@
+*tmp*
+pest/
+model/
+*.DS_Store
+PstFrom.log
+.vscode/
+__pycache__/
