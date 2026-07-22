@@ -16,12 +16,17 @@ from collections.abc import Iterable
 from pypestutils.pestutilslib import PestUtilsLib
 lib = PestUtilsLib()
 
-import keras_tuner as kt
-import tensorflow as tf
-from tensorflow.keras import mixed_precision
-from tensorflow.keras.callbacks import EarlyStopping
-tf.config.run_functions_eagerly(True)
-mixed_precision.set_global_policy('mixed_float16')
+try:
+    import keras_tuner as kt
+    import tensorflow as tf
+    from tensorflow.keras import mixed_precision
+    from tensorflow.keras.callbacks import EarlyStopping
+    tf.config.run_functions_eagerly(True)
+    mixed_precision.set_global_policy('mixed_float16')
+    _HAS_TF = True
+except ImportError:
+    kt = tf = mixed_precision = EarlyStopping = None
+    _HAS_TF = False  # surrogate path unavailable without tensorflow; model build does not need it
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler,QuantileTransformer
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -195,7 +200,7 @@ def get_botms(gwf, ws):
         botms.append(np.round(result['targval'], 1))
     return botms
 
-def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
+def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None, write = True):
 
     nper = 39  # Number of stress periods
 
@@ -295,7 +300,8 @@ def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
         head_filerecord=head_filerecord,
         budget_filerecord=budget_filerecord,
         printrecord=printrecord,)
-    sim.write_simulation()
+    if write:
+        sim.write_simulation()
     return sim
 
 
@@ -586,7 +592,7 @@ def make_dis(gwf):
     dis.set_all_data_external()
     return dis
 
-def initialize_chemistry(ws, nlay, nrow, ncol):
+def initialize_chemistry(ws, nlay, nrow, ncol, sim=None, gwt_name='Cl'):
     # get chemistry
 
     solutionsdf = pd.read_csv(os.path.join(datadir,"ic_aq_chem.csv"), index_col = 0)
@@ -663,16 +669,11 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     si = 0
 
     eq_dic = {}
-    #lets add pyrite first
     for ly in range(nlay):
+        eq_dic[ly] = {}   # init once per layer so EVERY mineral is kept (not overwritten per key)
         for key in eq_m0.keys():
-            # create a dictionary for each layer with key as the mineral name
-            # and values as a dictionary with si and m0
-        # si followed by m0 (init moles)
-            eq_dic[ly] = {key: {}}
-            eq_dic[ly][key]['si'] = si
-            eq_dic[ly][key]['m0'] = eq_m0[key][ly]
-            # eq_dic[ly+1] = {key: [si, eq_m0[key][ly]] for key in eq_m0.keys()}
+            # si followed by m0 (init moles) for each equilibrium mineral in this layer
+            eq_dic[ly][key] = {'si': si, 'm0': eq_m0[key][ly]}
     equilibriums = mup3d.EquilibriumPhases(eq_dic)
     equilibriums.set_ic(exchanger_ic)
 
@@ -711,7 +712,12 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
         # [1.0, kin_orgc_params, orgc_form, orgc_steps]
     kinetics = mup3d.KineticPhases(kin_dic)
     kinetics.set_ic(exchanger_ic)
-    model = mup3d.Mup3d('dizon36',solution, nlay, nrow, ncol)
+    if sim is not None:
+        # from_mf6: flopy builds GWF + a conservative Cl tracer GWT; mup3d clones the
+        # tracer GWT into one reactive GWT per PHREEQC component at write_simulation()
+        model = mup3d.Mup3d.from_mf6(sim, solution, name='dizon36', gwt_name=gwt_name)
+    else:
+        model = mup3d.Mup3d('dizon36',solution, nlay, nrow, ncol)
 
     # #set model workspace
     model.set_wd(ws)
@@ -1095,7 +1101,7 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
 
     return sim
 
-def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
+def make_gwt(sim, tracer = 'Cl', mup3d_m=None, write=True):
 
     gwf = sim.get_model("gwf")
     nlay = gwf.dis.nlay.get_data()
@@ -1114,7 +1120,10 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
 
     for comp in components:
         print(f"Setting transport for {comp}")
-        model_name = comp
+        # For the conservative tracer template (tracer is not None, used by from_mf6), name the
+        # model 'tracer' so it does not collide with the 'Cl' PHREEQC component that from_mf6
+        # clones. The well aux/SSM still reference `comp` (='Cl'), so the tracer follows Cl.
+        model_name = 'tracer' if tracer is not None else comp
         gwt = flopy.mf6.MFModel(
             sim,
             model_type="gwt6",
@@ -1153,7 +1162,9 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         nlay = dis.nlay.get_data()
         nrow = dis.nrow.get_data()
         ncol = dis.ncol.get_data()
-        if tracer is not None:
+        if mup3d_m is None:
+            strt = 0.0  # conservative tracer template for from_mf6; background handled by PHREEQC solutions
+        elif tracer is not None:
             strt = mup3d_m.sconc[comp]/1000 # to mmol
         else:
             strt = mup3d_m.sconc[comp]
@@ -1183,9 +1194,9 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         dsp.set_all_data_external()
 
         sourcerecarray = [
-                        ["welin", "aux", model_name],
-                        ["welout", "aux", model_name],
-                        ["chd", "aux", model_name]
+                        ["welin", "aux", comp],
+                        ["welout", "aux", comp],
+                        ["chd", "aux", comp]
                         ]
 
         ssm = flopy.mf6.ModflowGwtssm(
@@ -1244,7 +1255,8 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         )
         make_obs_pack(gwt)
 
-    sim.write_simulation() 
+    if write:
+        sim.write_simulation()
     return sim
 
 def clean_array_files(ws, files, gwf):
@@ -2073,7 +2085,8 @@ def plot_y_vs_yhat(columns,result_dict):
 
     return
 
-class PhysicsInformedLoss(tf.keras.losses.Loss):
+_LossBase = tf.keras.losses.Loss if _HAS_TF else object
+class PhysicsInformedLoss(_LossBase):
     """
     Physics-informed custom loss for geochemical surrogate models.
 
@@ -2341,7 +2354,7 @@ def surrogate_workflow(hyperparameter_tuning=False):
 
     return
 
-def main(prep_obs = True, run_base = True, 
+def main(prep_obs = True, run_base = True, run_base_struct=False,
          prep_pest = False, run_pest = False):
 
     if prep_obs:
@@ -2362,18 +2375,47 @@ def main(prep_obs = True, run_base = True,
 
         pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     if run_base_struct:
-        ws = prep_model_dir(name='test')
-        sim = make_gwf_structured(ws, tracer='Cl',mup3d_m=None)
-        # pyemu.os_utils.run('mf6', cwd=sim.sim_path)
-        gwf=sim.get_model("gwf")
+        ws = prep_model_dir(name='reactive')
+        # --- flopy MF6: GWF (Cl-aux wells + CHD) + ONE conservative Cl tracer GWT ---
+        sim = make_gwf_structured(ws, tracer='Cl', mup3d_m=None, write=False)
+        sim = make_gwt(sim, tracer='Cl', mup3d_m=None, write=False)   # single Cl tracer GWT = from_mf6 template (in-memory, no mid-build write)
+        gwf = sim.get_model("gwf")
         nlay = gwf.dis.nlay.get_data()
         nrow = gwf.dis.nrow.get_data()
         ncol = gwf.dis.ncol.get_data()
-        mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-        tracer = None
-        sim = make_gwf_structured(ws, tracer=tracer,mup3d_m=mup3d_m)
-        sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
-        pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+        # dizon36's make_wel_*/make_chd store SPD as externalized pandas-backed lists whose
+        # column count is locked. mf6rtm.from_mf6 grows the well/CHD auxiliary from 1 (the Cl
+        # tracer) to ncomp (one column per PHREEQC component); the locked form rejects that
+        # ("expected 3 got 18"). Rebuild these 3 packages as fresh in-memory (resizable) lists
+        # so the aux expansion in write_simulation() succeeds. See docs/from_mf6_notes.md.
+        _stress = {'welin': flopy.mf6.ModflowGwfwel,
+                   'welout': flopy.mf6.ModflowGwfwel,
+                   'CHD': flopy.mf6.ModflowGwfchd}
+        for _pn, _cls in _stress.items():
+            _p = gwf.get_package(_pn)
+            _spd = _p.stress_period_data.get_data()
+            gwf.remove_package(_pn)
+            _cls(gwf, stress_period_data=_spd, auxiliary='Cl', pname=_pn, save_flows=True)
+        # --- attach PHREEQC chemistry via from_mf6 (clones the Cl GWT into one reactive GWT per component) ---
+        mup3d_m = initialize_chemistry(ws, nlay, nrow, ncol, sim=sim, gwt_name='tracer')
+        # --- boundary injection chemistry (reproduces make_wel_in / make_chd mapping) ---
+        # welin: 5 layers x 39 periods -> solutions 2..196 (5 per period); welout: extraction; chd: background solution 1
+        inj_idx = [list(range(i, i + 5)) for i in range(2, 197, 5)]
+        def _ncells(pkgname):
+            spd = gwf.get_package(pkgname).stress_period_data.get_data()
+            return len(spd[sorted(spd)[0]])
+        cs_welin = mup3d.ChemStress('welin', type='aux')
+        cs_welin.set_spd({per: inj_idx[per] for per in range(nper)})
+        mup3d_m.set_chem_stress(cs_welin)
+        cs_welout = mup3d.ChemStress('welout', type='aux')
+        cs_welout.set_spd([1] * _ncells('welout'))   # extraction: injected conc ignored by MF6
+        mup3d_m.set_chem_stress(cs_welout)
+        cs_chd = mup3d.ChemStress('CHD', type='aux')
+        cs_chd.set_spd([1] * _ncells('CHD'))          # background solution 1 (pname is 'CHD')
+        mup3d_m.set_chem_stress(cs_chd)
+        # --- write coupled sim + run mf6rtm ---
+        mup3d_m.write_simulation()
+        pyemu.os_utils.run('mf6rtm', cwd=mup3d_m.wd)
     if prep_pest:
         template_ws=os.path.join('pest','pst_template')
         org_d = os.path.join('model','test')
