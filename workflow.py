@@ -668,10 +668,18 @@ def initialize_chemistry(ws, nlay, nrow, ncol, sim=None, gwt_name='Cl'):
     # following original model init SI is 0
     si = 0
 
+    # Ferrihydrite is deliberately NOT an equilibrium phase. Every reference build of this
+    # model (main lineage here, and rtm-tutorial's DISV twin) emits Orgmatter-only
+    # EQUILIBRIUM_PHASES blocks, and that is the configuration that reproduces PHT3D.
+    # Ferrihydrite has m0 = 0 in every layer of ic_surfaces.csv, so adding it at SI = 0 turns
+    # it into a precipitate-only Fe(3) sink, which collapses NO3 (~6x below PHT3D at WP3).
+    # It stays in eq_m0 only because the postfix punches EQUI("Ferrihydrite") (returns 0).
+    eq_keys = ["Orgmatter"]
+
     eq_dic = {}
     for ly in range(nlay):
-        eq_dic[ly] = {}   # init once per layer so EVERY mineral is kept (not overwritten per key)
-        for key in eq_m0.keys():
+        eq_dic[ly] = {}
+        for key in eq_keys:
             # si followed by m0 (init moles) for each equilibrium mineral in this layer
             eq_dic[ly][key] = {'si': si, 'm0': eq_m0[key][ly]}
     equilibriums = mup3d.EquilibriumPhases(eq_dic)
@@ -773,6 +781,9 @@ def initialize_chemistry(ws, nlay, nrow, ncol, sim=None, gwt_name='Cl'):
     model.set_config(
                     reactive_timing='all',
                     reactive_externalio=True,
+                    solver_threshold=0.0,   # react every cell every step (0.3.2 'epsaqu'=0);
+                                            # 0.5.1's default 1e-10 skips near-static cells and
+                                            # freezes kinetic phases -> wrong Fe/redox
                     emulator_training_data=True,
                     emulator_target_variables=targetvars,
                     emulator_feature_variables=featvars,
@@ -2413,6 +2424,14 @@ def main(prep_obs = True, run_base = True, run_base_struct=False,
         cs_chd = mup3d.ChemStress('CHD', type='aux')
         cs_chd.set_spd([1] * _ncells('CHD'))          # background solution 1 (pname is 'CHD')
         mup3d_m.set_chem_stress(cs_chd)
+        # --- per-component MST: Tmp is heat, and heat retards (kd = 2*ne/1850) ---
+        # from_mf6 clones ONE tracer MST into every component, so without this override the
+        # Tmp GWT loses its linear sorption and heat travels unretarded. Pyrite kinetics are
+        # temperature-dependent, so a wrong temperature field propagates into the whole
+        # redox chain. Values match make_gwt's `if comp=='Tmp'` branch.
+        mup3d_m.set_mst_override({'Tmp': {'sorption': 'Linear',
+                                          'bulk_density': 1850.0,
+                                          'distcoef': 2.1141E-04}})
         # --- write coupled sim + run mf6rtm ---
         mup3d_m.write_simulation()
         pyemu.os_utils.run('mf6rtm', cwd=mup3d_m.wd)
