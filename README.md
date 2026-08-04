@@ -53,27 +53,34 @@ rate laws carry an Arrhenius temperature factor.
   N(+5), N(0), Na, S(−2), S(6), Si, Amm, Tmp, pH, pe.
 - **Reactions:** equilibrium speciation and redox of the major ions, cation exchange on five
   exchangers (CaX₂, FeX₂, KX, MgX₂, NaX), sediment-bound immobile organic matter (`Orgmatter`)
-  as an equilibrium phase supplying DOC, and kinetic Pyrite and Orgc. The pyrite rate follows
-  Williamson & Rimstidt, `r_pyr ∝ C_O2^0.5 · C_H+^-0.11 · (m/m0)^0.67`, extended for oxidation by
-  nitrate and scaled by the Arrhenius factor.
+  and ferrihydrite `Fe(OH)3` as equilibrium phases, and kinetic Pyrite and Orgc. The pyrite rate
+  follows Williamson & Rimstidt, `r_pyr ∝ C_O2^0.5 · C_H+^-0.11 · (m/m0)^0.67`, extended for
+  oxidation by nitrate and scaled by the Arrhenius factor.
 - **Thermodynamic database:** `data/datab.dat`, shared by both codes.
 
-> **Note — Ferrihydrite.** The paper's reaction network includes mineral equilibrium for
-> ferrihydrite `Fe(OH)3`, which is the *product* of both pyrite oxidation reactions above. The
-> calibrated configuration in this repo pins the equilibrium phases to `Orgmatter` only, so the
-> Fe(3) released by pyrite oxidation has no mineral sink and stays dissolved. That is the leading
-> explanation for the WP1 pH discrepancy noted above.
+> **Note — Ferrihydrite.** `Fe(OH)3` is the *product* of both pyrite oxidation reactions above, and
+> the source paper includes mineral equilibrium for it, so it is enabled here (`eq_keys` in
+> `initialize_chemistry`, matched by the type-D rows in `pht3d_species_csv`). Its `m0` is 0 in every
+> layer of `ic_surfaces.csv`, so it acts as a precipitate-only sink for the Fe(3) that pyrite
+> oxidation releases. **The N and redox parameters were fitted while it was absent**, so they are
+> not re-tuned for it: enabling it improves the NO₃ and SO₄ fit slightly but degrades the pH fit
+> (RMSE 0.158 → 0.194). A recalibration with it on is outstanding.
 
 ## Code comparison
 
 The two codes agree closely. Late-time (t ≥ 400 d) mf6rtm ÷ PHT3D ratios at WP2/WP3 are
-1.08–1.10 for NO₃ and ~1.00 for SO₄, TIC and pH, and the conservative chloride front matches to
-~0.5 % RMS. The one remaining discrepancy is pH at WP1, where PHT3D runs up to ~0.3 units high
-between 100 and 300 days; it tracks a difference in dissolved Fe(3), since mf6rtm transports total
-elements and lets PHREEQC redistribute valence each step while PHT3D transports the individual
-redox states.
+1.07–1.09 for NO₃ and ~1.00 for SO₄, TIC and pH, and the conservative chloride front matches to
+~0.5 % RMS.
 
-In all figures: **mf6rtm** is the line, **PHT3D** open circles, **observations** filled dots.
+The one remaining discrepancy is pH at WP1, the well furthest from the injection point. Outside the
+reactive front the two codes agree to a mean 0.064 pH units, but during the front's passage
+(100–240 d) PHT3D swings to 4.7 then 7.0 where mf6rtm stays between 6.3 and 6.7 — the acid pulse
+from `Fe(OH)3` precipitation, which the codes time differently because mf6rtm transports total
+elements and lets PHREEQC redistribute valence each step while PHT3D transports the individual
+redox states. Note the pH row is clipped at 6, so that excursion runs off the bottom of the axis.
+
+**mf6rtm** is the solid blue line throughout. On the three-way figure PHT3D is a dashed red line and
+the observations are filled dots; on the two-way figures the compared series is open circles.
 Rows are DO / NO₃ / SO₄ / TIC / pH; columns are WP3 / WP2 / WP1, screen `f2`.
 
 ### mf6rtm vs observations

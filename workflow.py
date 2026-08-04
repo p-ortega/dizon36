@@ -38,6 +38,10 @@ import pickle
 datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
 props_ws = os.path.join(datadir, 'props')
+# Kriging pilot-point values for the original ("og") K field, one row per layer per
+# data/botm.shp feature. Extracted from the og model by export_og_pilot_props() so the
+# structured build no longer needs a built model directory on disk -- see load_og_pilot_props.
+OG_PROPS_CSV = os.path.join(props_ws, 'og_pilot_props.csv')
 
 nper = 39  # Number of stress periods
 
@@ -129,25 +133,87 @@ def interpolate_property_to_grid(gwf, ws, property_array, property_name="k"):
     return np.array(interpolated)
 
 
-def get_properties_from_og(ws, gwf, prop = ['k', 'ss', 'sy']):
-    sim_og = flopy.mf6.MFSimulation.load(sim_ws = ws,
-                                  sim_name = 'gwf', 
-                                  version='mf6',
-                                    exe_name='mf6',
-                                    verbosity_level=0)
-    gwf_og = sim_og.get_model("gwf")
-    dict_prop = {}
-    for p in prop:
-        # print(p)
-        if p in ['k', 'k33']:
-            # print(f"property: {p} min: {karr.min()} max: {karr.max()}")
-            og_arr = getattr(gwf_og.npf, p).get_data()
-        if p in ['ss', 'sy']:
-            og_arr = getattr(gwf_og.sto, p).get_data()
-            # print(f"property: {p} min: {sarr.min()} max: {sarr.max()}")
-        prop_arr = interpolate_property_to_grid(gwf, ws, og_arr, p)
-        dict_prop[p] = prop_arr
+def _botm_pilot_points():
+    """(x, y) of the data/botm.shp centroids -- the kriging pilot points, in file order."""
+    bps = gpd.read_file(os.path.join(datadir, 'botm.shp'))
+    return bps.geometry.centroid.x.values, bps.geometry.centroid.y.values
 
+
+def export_og_pilot_props(ws=os.path.join("model", "reactive_demo"), out=OG_PROPS_CSV):
+    """One-off: extract the og K pilot-point values from a built model into OG_PROPS_CSV.
+
+    The og model is a 12x10x51 grid and data/botm.shp has exactly 510 features, one per og cell,
+    so each layer of `npf.k`/`npf.k33` is really a vector of pilot-point values keyed to that
+    shapefile -- no grid semantics are needed to reuse them. Kept in the repo so the CSV's origin
+    is documented and regenerable rather than a mystery blob.
+    """
+    sim_og = flopy.mf6.MFSimulation.load(sim_ws=ws, sim_name='gwf', version='mf6',
+                                        exe_name='mf6', verbosity_level=0,
+                                        load_only=['dis', 'npf'])
+    gwf_og = sim_og.get_model("gwf")
+    ppx, ppy = _botm_pilot_points()
+    rows = []
+    for p in ('k', 'k33'):
+        arr = np.asarray(getattr(gwf_og.npf, p).get_data())
+        nlay = arr.shape[0]
+        for lay in range(nlay):
+            vals = arr[lay].flatten()
+            assert len(vals) == len(ppx), (
+                f"{p} layer {lay + 1} has {len(vals)} cells but botm.shp has {len(ppx)} "
+                "features -- the pilot-point mapping no longer holds")
+            for i, v in enumerate(vals):
+                rows.append((lay + 1, i, ppx[i], ppy[i], p, float(v)))
+    df = pd.DataFrame(rows, columns=['layer', 'pp_index', 'x', 'y', 'prop', 'value'])
+    df = df.pivot_table(index=['layer', 'pp_index', 'x', 'y'], columns='prop',
+                        values='value').reset_index()
+    df.columns.name = None
+    df = df[['layer', 'pp_index', 'x', 'y', 'k', 'k33']].sort_values(['layer', 'pp_index'])
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"wrote {out}: {len(df)} rows ({df.layer.nunique()} layers x {df.pp_index.nunique()} pts)")
+    return df
+
+
+def load_og_pilot_props(csv=OG_PROPS_CSV, atol=1e-6):
+    """{'k': (nlay, npp), 'k33': (nlay, npp)} pilot-point values for the og K field.
+
+    Verifies the stored x/y against the live data/botm.shp centroids, so a reordered or edited
+    shapefile fails loudly instead of silently pairing values with the wrong locations -- the one
+    way this indirection could corrupt the K field without anything looking wrong.
+    """
+    df = pd.read_csv(csv).sort_values(['layer', 'pp_index'])
+    ppx, ppy = _botm_pilot_points()
+    npp = len(ppx)
+    lay0 = df[df.layer == df.layer.min()]
+    if len(lay0) != npp:
+        raise ValueError(f"{csv} has {len(lay0)} pilot points per layer but data/botm.shp has {npp}")
+    if not (np.allclose(lay0.x.values, ppx, atol=atol)
+            and np.allclose(lay0.y.values, ppy, atol=atol)):
+        raise ValueError(f"{csv} pilot-point coordinates do not match data/botm.shp centroids; "
+                         "regenerate it with export_og_pilot_props()")
+    nlay = df.layer.nunique()
+    return {p: df[p].values.reshape((nlay, npp)) for p in ('k', 'k33')}
+
+
+def get_properties(gwf, fac_ws, prop=('k', 'k33')):
+    """Krige the og K pilot-point values onto `gwf`'s grid; returns {prop: (nlay,nrow,ncol)}.
+
+    Replaces the former get_properties_from_og, which loaded model/reactive_demo -- a 3.6 GB
+    gitignored artifact that prep_model_dir wipes, so a fresh clone could not build at all. The
+    values now come from OG_PROPS_CSV and `fac_ws` (the directory being built) receives the
+    kriging scratch file, instead of it being written back into the og model directory.
+
+    Only k and k33 are kriged. `ss` in the og model is a uniform 1e-3, and kriging a constant
+    field returns that constant, so it is set directly. `sy` was never passed to ModflowGwfsto
+    (iconvert=0, the aquifer is confined), so kriging it was pure waste.
+    """
+    pilot = load_og_pilot_props()
+    nlay = gwf.dis.nlay.get_data()
+    nrow = gwf.dis.nrow.get_data()
+    ncol = gwf.dis.ncol.get_data()
+    dict_prop = {p: interpolate_property_to_grid(gwf, fac_ws, pilot[p], p) for p in prop}
+    # full array rather than a scalar so set_all_data_external() writes the same external file
+    dict_prop['ss'] = np.full((nlay, nrow, ncol), 1.e-3)
     return dict_prop
 
 def get_botms(gwf, ws):
@@ -255,8 +321,7 @@ def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None, w
     ncol = dis.ncol.get_data()
 
     # dis.idomain.export(os.path.join("output", "dis_botm.vtk"), fmt="vtk")
-    dict_prop = get_properties_from_og(ws=os.path.join("model", "reactive_demo"),
-                            gwf=gwf, prop = ['k', 'k33', 'ss', 'sy'])
+    dict_prop = get_properties(gwf, fac_ws=ws, prop=('k', 'k33'))
 
     ihead = 0 #(meters)
     strt = ihead * np.ones((nlay, nrow, ncol))
@@ -271,9 +336,12 @@ def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None, w
         # k33overk = True
     )
     npf.set_all_data_external()
+    # DEAD: unused -- sto below takes ss from dict_prop (1e-3), not this 1e-4. Left in place
+    # because it looks like an unrealised intent to use 1e-4; changing it would alter the flow
+    # field, so it needs a deliberate decision rather than a silent refactor.
     ss = np.ones((nlay, nrow, ncol)) * 1.e-4
-    sto = flopy.mf6.ModflowGwfsto(gwf, 
-                                  ss=dict_prop['ss'], 
+    sto = flopy.mf6.ModflowGwfsto(gwf,
+                                  ss=dict_prop['ss'],
                                   iconvert=0,
                                     # steady_state={0: False},
                                     transient={0: True})
@@ -668,13 +736,23 @@ def initialize_chemistry(ws, nlay, nrow, ncol, sim=None, gwt_name='Cl'):
     # following original model init SI is 0
     si = 0
 
-    # Ferrihydrite is deliberately NOT an equilibrium phase. Every reference build of this
-    # model (main lineage here, and rtm-tutorial's DISV twin) emits Orgmatter-only
-    # EQUILIBRIUM_PHASES blocks, and that is the configuration that reproduces PHT3D.
-    # Ferrihydrite has m0 = 0 in every layer of ic_surfaces.csv, so adding it at SI = 0 turns
-    # it into a precipitate-only Fe(3) sink, which collapses NO3 (~6x below PHT3D at WP3).
-    # It stays in eq_m0 only because the postfix punches EQUI("Ferrihydrite") (returns 0).
-    eq_keys = ["Orgmatter"]
+    # Ferrihydrite as an equilibrium phase: Prommer & Stuyfzand (2005) docs/est0486768.pdf
+    # p. 2202 include "mineral equilibrium for ferrihydrite (Fe(OH)3)" in their reaction
+    # network, and Fe(OH)3 is the product of BOTH pyrite oxidation reactions, so the reference
+    # model precipitates the Fe(3) that pyrite oxidation releases. With it off, Fe(3) has no
+    # mineral sink and stays dissolved at ~2.5e-4 mol/L at pH 6.8 -- far above ferrihydrite
+    # solubility -- which is the leading explanation for the WP1 pH offset vs PHT3D.
+    # m0 = 0 in every layer of ic_surfaces.csv, so it acts as a precipitate-only sink.
+    #
+    # Ferrihydrite was absent from every pre-2026 deck only because of a bug: main's eq_dic loop
+    # re-initialised `eq_dic[ly] = {key: {}}` *inside* the per-mineral loop, so each mineral wiped
+    # the previous one and only the last (Orgmatter) survived. a42fec6 fixed that. The N and redox
+    # parameters were therefore fitted while this sink was accidentally missing -- enabling it
+    # improves the NO3/SO4 fit slightly but degrades pH (RMSE 0.158 -> 0.194), so a recalibration
+    # is outstanding.
+    # NOTE: must be matched in the PHT3D twin (pht3d_species_csv type-D rows) or the two codes
+    # are no longer comparable.
+    eq_keys = ["Ferrihydrite", "Orgmatter"]
 
     eq_dic = {}
     for ly in range(nlay):
@@ -2579,10 +2657,10 @@ def pht3d_species_csv(ws=PHT3D_WS):
             row(name=name, initial_concentration=float(aq.get(var, 0.0)), species=species,
                 argument=arg, type="B", mobility=mob, ion_exchange="no")
 
-    # comp 22: equilibrium mineral (SI in `argument`, m0 in initial_concentration). Orgmatter
-    # only -- the calibrated mf6rtm deck (model/reactive/phinp.dat) has no Ferrihydrite, and
-    # adding it would give PHT3D a precipitate-only Fe(3) sink mf6rtm lacks.
-    for var in ("Orgmatter",):
+    # equilibrium minerals (SI in `argument`, m0 in initial_concentration). MUST match the
+    # `eq_keys` list in initialize_chemistry -- these two are the same physical choice expressed
+    # in each code's dialect, and a mismatch makes the codes incomparable.
+    for var in ("Ferrihydrite", "Orgmatter"):
         row(name=var.lower(), initial_concentration=float(surf1.get(var, 0.0)), species=var,
             argument=0.0, type="D", mobility="immobile", ion_exchange="no")
 
@@ -2937,7 +3015,10 @@ def load_pht3d_out():
 def plot_comparison(show_obs=True, show_pht3d=True, ws=MF6_REACTIVE_WS, out=None):
     """5x3 panel (rows DO/NO3/SO4/TIC/pH, cols WP3/WP2/WP1) at screen f2.
 
-    mf6rtm is a line, the PHT3D twin open circles, observations filled dots.
+    mf6rtm is a solid line and observations are filled dots. PHT3D is drawn as open circles when
+    it is the only thing compared against mf6rtm, but as a dashed line on the three-way figure,
+    where circles compete with the observation markers -- there mf6rtm is also thickened so the
+    two model curves stay separable.
     """
     import matplotlib.ticker as mticker
     sel = load_mf6rtm_series(ws)
@@ -2947,6 +3028,7 @@ def plot_comparison(show_obs=True, show_pht3d=True, ws=MF6_REACTIVE_WS, out=None
         tag = {(True, True): 'obs_pht3d', (True, False): 'obs', (False, True): 'pht3d'}[
             (show_obs, show_pht3d)]
         out = os.path.join("output", f"dizon_mf6rtm_vs_{tag}.png")
+    three_way = show_obs and show_pht3d
 
     fig, axes = plt.subplots(len(FIG_VARS), len(FIG_WPS), figsize=(8, 8.5),
                              sharex='col', sharey='row')
@@ -2955,15 +3037,24 @@ def plot_comparison(show_obs=True, show_pht3d=True, ws=MF6_REACTIVE_WS, out=None
         for c, wp in enumerate(FIG_WPS):
             ax = axes[r, c]
             line = sel[(sel['wp'] == wp) & (sel['f'] == FIG_SCREEN)].sort_values('time')
-            ax.plot(line['time'], line[var], color='tab:blue', lw=1.3, label='mf6rtm')
+            ax.plot(line['time'], line[var], color='tab:blue',
+                    lw=2.2 if three_way else 1.3, label='mf6rtm')
             if pht is not None:
                 pp = pht[(pht['wp'] == wp) & (pht['pvar'] == var)].sort_values('time')
-                ax.plot(pp['time'], pp['value'], 'o', mfc='none', mec='tab:red', mew=1.1,
-                        ms=4.5, label='PHT3D')
+                if three_way:
+                    ax.plot(pp['time'], pp['value'], ls='--', color='tab:red', lw=1.3,
+                            label='PHT3D')
+                else:
+                    ax.plot(pp['time'], pp['value'], 'o', mfc='none', mec='tab:red', mew=1.1,
+                            ms=4.5, label='PHT3D')
             if meas is not None:
                 mp = meas[(meas['wp'] == wp) & (meas['f'] == FIG_SCREEN)
                           & (meas['variable'] == var)]
-                ax.scatter(mp['time'], mp['value'], c='k', s=18, zorder=10, label='observed')
+                if three_way:   # filled, to stay distinct from the dashed PHT3D line
+                    ax.scatter(mp['time'], mp['value'], c='k', s=18, zorder=10, label='observed')
+                else:
+                    ax.scatter(mp['time'], mp['value'], facecolors='none', edgecolors='k',
+                               linewidths=1.1, s=22, zorder=10, label='observed')
             ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
             ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 2))
             if r == 0:
