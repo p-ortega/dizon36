@@ -4,20 +4,34 @@ channels:
 dependencies:
   - python=3.12
   - pip
-  - pandas>=2.0
-  - numpy>=1.25 
-  - matplotlib 
-  - jupyter 
-  - notebook 
-  - rtree
-  - pyproj>=2.0
-  - pyshp
-  - scikit-learn
-  - shapely
+  - pandas=2.3.2
+  - numpy=2.3.2
+  - matplotlib=3.10.6
+  - jupyter=1.1.1
+  - notebook=7.4.5
+  - rtree=1.4.1
+  - pyproj=3.7.2
+  - pyshp=3.0.1
+  - scikit-learn=1.7.1
+  - shapely=2.1.1
+  - geopandas=1.1.1
+  - scipy=1.16.1
+  # tensorflow/keras-tuner drive the ML surrogate only (surrogate_workflow); workflow.py guards
+  # the import so the model build and the PHT3D comparison run without them. Not currently
+  # installed in the working env, hence unpinned.
   - tensorflow
   - pip:
-      - flopy
-      - pyemu
-      - pypestutils
-      - vtk
-      - git+https://github.com/p-ortega/mf6rtm.git@feature/externalio
+      - flopy==3.9.3
+      - pypestutils==0.3.0
+      - vtk==9.5.1
+      - pyvista==0.48.4
+      - openpyxl==3.1.5
+      # mf6rtm's chemistry engine and the MODFLOW 6 API it drives
+      - phreeqcrm==0.0.16
+      - modflowapi==0.2.0
+      - xmipy==1.5.0
+      # Vendored and installed editable: both carry local fixes, so a released wheel or a git
+      # pin would silently drop them. mf6rtm 0.5.1 holds the from_mf6 DSP-options and
+      # Tmp-sorption fixes plus the flat-config folding (see docs/from_mf6_notes.md).
+      - -e ./dependencies/mf6rtm
+      - -e ./dependencies/pyemu

@@ -1,0 +1,2 @@
+[console_scripts]
+mf6rtm = mf6rtm:run_cmd

@@ -1,0 +1,54 @@
+2 -2 0 1e-10 0.001 0
+0.05
+18
+4
+0
+0
+0 2 0 2
+Tracer_fresh
+Temper
+O(0)
+N(5)
+Fe(2)
+Fe(3)
+Ca
+C(4)
+C(-4)
+Cl charge
+Na
+S(6)
+S(-2)
+Amm
+Mn(2)
+Mn(3)
+pH
+pe
+Orgc 11
+1e-10
+1e-10
+2.5e-12
+5e-13
+2.94e-05
+0.000155
+0.0008
+0.0001
+1e-06
+1e-06
+1.0
+-Formula CH2O 1 Amm 0.15
+Amm_ox 2
+0.0001
+1e-08
+-Formula  Amm -1 NH3 1
+Rhodochrosite
+Siderite
+Calcite 0.3
+Goethite
+Pyrolusite 2
+2.5e-12
+1e-10
+-Formula ; -tol 1e-7
+FeS(ppt) 2
+1e-11
+1e-10
+-Formula ; -cvode false
