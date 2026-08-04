@@ -3015,10 +3015,10 @@ def load_pht3d_out():
 def plot_comparison(show_obs=True, show_pht3d=True, ws=MF6_REACTIVE_WS, out=None):
     """5x3 panel (rows DO/NO3/SO4/TIC/pH, cols WP3/WP2/WP1) at screen f2.
 
-    mf6rtm is a solid line and observations are filled dots. PHT3D is drawn as open circles when
+    mf6rtm is a solid line and observations are open circles. PHT3D is drawn as open circles when
     it is the only thing compared against mf6rtm, but as a dashed line on the three-way figure,
-    where circles compete with the observation markers -- there mf6rtm is also thickened so the
-    two model curves stay separable.
+    where circles would collide with the observation markers -- there mf6rtm is also thickened so
+    the two model curves stay separable.
     """
     import matplotlib.ticker as mticker
     sel = load_mf6rtm_series(ws)
@@ -3050,11 +3050,8 @@ def plot_comparison(show_obs=True, show_pht3d=True, ws=MF6_REACTIVE_WS, out=None
             if meas is not None:
                 mp = meas[(meas['wp'] == wp) & (meas['f'] == FIG_SCREEN)
                           & (meas['variable'] == var)]
-                if three_way:   # filled, to stay distinct from the dashed PHT3D line
-                    ax.scatter(mp['time'], mp['value'], c='k', s=18, zorder=10, label='observed')
-                else:
-                    ax.scatter(mp['time'], mp['value'], facecolors='none', edgecolors='k',
-                               linewidths=1.1, s=22, zorder=10, label='observed')
+                ax.scatter(mp['time'], mp['value'], facecolors='none', edgecolors='k',
+                           linewidths=1.1, s=22, zorder=10, label='observed')
             ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
             ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 2))
             if r == 0:

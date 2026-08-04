@@ -79,14 +79,14 @@ from `Fe(OH)3` precipitation, which the codes time differently because mf6rtm tr
 elements and lets PHREEQC redistribute valence each step while PHT3D transports the individual
 redox states. Note the pH row is clipped at 6, so that excursion runs off the bottom of the axis.
 
-**mf6rtm** is the solid blue line throughout. On the three-way figure PHT3D is a dashed red line and
-the observations are filled dots; on the two-way figures the compared series is open circles.
-Rows are DO / NO₃ / SO₄ / TIC / pH; columns are WP3 / WP2 / WP1, screen `f2`.
+**mf6rtm** is the solid blue line and **observations** are open circles throughout. **PHT3D** is a
+dashed red line where the observations are also shown, and open circles where it is compared
+against mf6rtm alone. Rows are DO / NO₃ / SO₄ / TIC / pH; columns are WP3 / WP2 / WP1, screen `f2`.
 
 ### mf6rtm vs observations
 ![mf6rtm vs observed](output/dizon_mf6rtm_vs_obs.png)
 
-### mf6rtm vs the PHT3D twin
+### mf6rtm vs PHT3D
 ![mf6rtm vs PHT3D](output/dizon_mf6rtm_vs_pht3d.png)
 
 ### mf6rtm vs observations vs PHT3D
@@ -110,7 +110,7 @@ main(
 )
 ```
 
-The PHT3D twin is derived from the mf6rtm run in `model/reactive`, so run `run_base_struct`
+The PHT3D model build is derived from the mf6rtm run in `model/reactive`, so run `run_base_struct`
 first. `build_pht3d` gates the MODFLOW-2005 flow twin against the MF6 heads before building
 transport on its flow-transport link file.
 
