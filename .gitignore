@@ -5,3 +5,12 @@ model/
 PstFrom.log
 .vscode/
 __pycache__/
+
+# output/ holds hundreds of MB of regenerable artifacts (VTK, animations, ensemble plots).
+# Keep only the comparison figures the README embeds. Note this must be `output/*`, not
+# `output/`: an excluded directory is never descended into, so the negations below would
+# not be reachable.
+output/*
+!output/dizon_mf6rtm_vs_obs.png
+!output/dizon_mf6rtm_vs_pht3d.png
+!output/dizon_mf6rtm_vs_obs_pht3d.png

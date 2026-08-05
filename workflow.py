@@ -16,12 +16,17 @@ from collections.abc import Iterable
 from pypestutils.pestutilslib import PestUtilsLib
 lib = PestUtilsLib()
 
-import keras_tuner as kt
-import tensorflow as tf
-from tensorflow.keras import mixed_precision
-from tensorflow.keras.callbacks import EarlyStopping
-tf.config.run_functions_eagerly(True)
-mixed_precision.set_global_policy('mixed_float16')
+try:
+    import keras_tuner as kt
+    import tensorflow as tf
+    from tensorflow.keras import mixed_precision
+    from tensorflow.keras.callbacks import EarlyStopping
+    tf.config.run_functions_eagerly(True)
+    mixed_precision.set_global_policy('mixed_float16')
+    _HAS_TF = True
+except ImportError:
+    kt = tf = mixed_precision = EarlyStopping = None
+    _HAS_TF = False  # surrogate path unavailable without tensorflow; model build does not need it
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler,QuantileTransformer
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -33,6 +38,10 @@ import pickle
 datadir = os.path.join("data")
 dis_ws = os.path.join(datadir, 'dis')
 props_ws = os.path.join(datadir, 'props')
+# Kriging pilot-point values for the original ("og") K field, one row per layer per
+# data/botm.shp feature. Extracted from the og model by export_og_pilot_props() so the
+# structured build no longer needs a built model directory on disk -- see load_og_pilot_props.
+OG_PROPS_CSV = os.path.join(props_ws, 'og_pilot_props.csv')
 
 nper = 39  # Number of stress periods
 
@@ -124,25 +133,87 @@ def interpolate_property_to_grid(gwf, ws, property_array, property_name="k"):
     return np.array(interpolated)
 
 
-def get_properties_from_og(ws, gwf, prop = ['k', 'ss', 'sy']):
-    sim_og = flopy.mf6.MFSimulation.load(sim_ws = ws,
-                                  sim_name = 'gwf', 
-                                  version='mf6',
-                                    exe_name='mf6',
-                                    verbosity_level=0)
-    gwf_og = sim_og.get_model("gwf")
-    dict_prop = {}
-    for p in prop:
-        # print(p)
-        if p in ['k', 'k33']:
-            # print(f"property: {p} min: {karr.min()} max: {karr.max()}")
-            og_arr = getattr(gwf_og.npf, p).get_data()
-        if p in ['ss', 'sy']:
-            og_arr = getattr(gwf_og.sto, p).get_data()
-            # print(f"property: {p} min: {sarr.min()} max: {sarr.max()}")
-        prop_arr = interpolate_property_to_grid(gwf, ws, og_arr, p)
-        dict_prop[p] = prop_arr
+def _botm_pilot_points():
+    """(x, y) of the data/botm.shp centroids -- the kriging pilot points, in file order."""
+    bps = gpd.read_file(os.path.join(datadir, 'botm.shp'))
+    return bps.geometry.centroid.x.values, bps.geometry.centroid.y.values
 
+
+def export_og_pilot_props(ws=os.path.join("model", "reactive_demo"), out=OG_PROPS_CSV):
+    """One-off: extract the og K pilot-point values from a built model into OG_PROPS_CSV.
+
+    The og model is a 12x10x51 grid and data/botm.shp has exactly 510 features, one per og cell,
+    so each layer of `npf.k`/`npf.k33` is really a vector of pilot-point values keyed to that
+    shapefile -- no grid semantics are needed to reuse them. Kept in the repo so the CSV's origin
+    is documented and regenerable rather than a mystery blob.
+    """
+    sim_og = flopy.mf6.MFSimulation.load(sim_ws=ws, sim_name='gwf', version='mf6',
+                                        exe_name='mf6', verbosity_level=0,
+                                        load_only=['dis', 'npf'])
+    gwf_og = sim_og.get_model("gwf")
+    ppx, ppy = _botm_pilot_points()
+    rows = []
+    for p in ('k', 'k33'):
+        arr = np.asarray(getattr(gwf_og.npf, p).get_data())
+        nlay = arr.shape[0]
+        for lay in range(nlay):
+            vals = arr[lay].flatten()
+            assert len(vals) == len(ppx), (
+                f"{p} layer {lay + 1} has {len(vals)} cells but botm.shp has {len(ppx)} "
+                "features -- the pilot-point mapping no longer holds")
+            for i, v in enumerate(vals):
+                rows.append((lay + 1, i, ppx[i], ppy[i], p, float(v)))
+    df = pd.DataFrame(rows, columns=['layer', 'pp_index', 'x', 'y', 'prop', 'value'])
+    df = df.pivot_table(index=['layer', 'pp_index', 'x', 'y'], columns='prop',
+                        values='value').reset_index()
+    df.columns.name = None
+    df = df[['layer', 'pp_index', 'x', 'y', 'k', 'k33']].sort_values(['layer', 'pp_index'])
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"wrote {out}: {len(df)} rows ({df.layer.nunique()} layers x {df.pp_index.nunique()} pts)")
+    return df
+
+
+def load_og_pilot_props(csv=OG_PROPS_CSV, atol=1e-6):
+    """{'k': (nlay, npp), 'k33': (nlay, npp)} pilot-point values for the og K field.
+
+    Verifies the stored x/y against the live data/botm.shp centroids, so a reordered or edited
+    shapefile fails loudly instead of silently pairing values with the wrong locations -- the one
+    way this indirection could corrupt the K field without anything looking wrong.
+    """
+    df = pd.read_csv(csv).sort_values(['layer', 'pp_index'])
+    ppx, ppy = _botm_pilot_points()
+    npp = len(ppx)
+    lay0 = df[df.layer == df.layer.min()]
+    if len(lay0) != npp:
+        raise ValueError(f"{csv} has {len(lay0)} pilot points per layer but data/botm.shp has {npp}")
+    if not (np.allclose(lay0.x.values, ppx, atol=atol)
+            and np.allclose(lay0.y.values, ppy, atol=atol)):
+        raise ValueError(f"{csv} pilot-point coordinates do not match data/botm.shp centroids; "
+                         "regenerate it with export_og_pilot_props()")
+    nlay = df.layer.nunique()
+    return {p: df[p].values.reshape((nlay, npp)) for p in ('k', 'k33')}
+
+
+def get_properties(gwf, fac_ws, prop=('k', 'k33')):
+    """Krige the og K pilot-point values onto `gwf`'s grid; returns {prop: (nlay,nrow,ncol)}.
+
+    Replaces the former get_properties_from_og, which loaded model/reactive_demo -- a 3.6 GB
+    gitignored artifact that prep_model_dir wipes, so a fresh clone could not build at all. The
+    values now come from OG_PROPS_CSV and `fac_ws` (the directory being built) receives the
+    kriging scratch file, instead of it being written back into the og model directory.
+
+    Only k and k33 are kriged. `ss` in the og model is a uniform 1e-3, and kriging a constant
+    field returns that constant, so it is set directly. `sy` was never passed to ModflowGwfsto
+    (iconvert=0, the aquifer is confined), so kriging it was pure waste.
+    """
+    pilot = load_og_pilot_props()
+    nlay = gwf.dis.nlay.get_data()
+    nrow = gwf.dis.nrow.get_data()
+    ncol = gwf.dis.ncol.get_data()
+    dict_prop = {p: interpolate_property_to_grid(gwf, fac_ws, pilot[p], p) for p in prop}
+    # full array rather than a scalar so set_all_data_external() writes the same external file
+    dict_prop['ss'] = np.full((nlay, nrow, ncol), 1.e-3)
     return dict_prop
 
 def get_botms(gwf, ws):
@@ -195,7 +266,7 @@ def get_botms(gwf, ws):
         botms.append(np.round(result['targval'], 1))
     return botms
 
-def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
+def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None, write = True):
 
     nper = 39  # Number of stress periods
 
@@ -250,8 +321,7 @@ def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
     ncol = dis.ncol.get_data()
 
     # dis.idomain.export(os.path.join("output", "dis_botm.vtk"), fmt="vtk")
-    dict_prop = get_properties_from_og(ws=os.path.join("model", "reactive_demo"),
-                            gwf=gwf, prop = ['k', 'k33', 'ss', 'sy'])
+    dict_prop = get_properties(gwf, fac_ws=ws, prop=('k', 'k33'))
 
     ihead = 0 #(meters)
     strt = ihead * np.ones((nlay, nrow, ncol))
@@ -266,9 +336,12 @@ def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
         # k33overk = True
     )
     npf.set_all_data_external()
+    # DEAD: unused -- sto below takes ss from dict_prop (1e-3), not this 1e-4. Left in place
+    # because it looks like an unrealised intent to use 1e-4; changing it would alter the flow
+    # field, so it needs a deliberate decision rather than a silent refactor.
     ss = np.ones((nlay, nrow, ncol)) * 1.e-4
-    sto = flopy.mf6.ModflowGwfsto(gwf, 
-                                  ss=dict_prop['ss'], 
+    sto = flopy.mf6.ModflowGwfsto(gwf,
+                                  ss=dict_prop['ss'],
                                   iconvert=0,
                                     # steady_state={0: False},
                                     transient={0: True})
@@ -295,7 +368,8 @@ def make_gwf_structured(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
         head_filerecord=head_filerecord,
         budget_filerecord=budget_filerecord,
         printrecord=printrecord,)
-    sim.write_simulation()
+    if write:
+        sim.write_simulation()
     return sim
 
 
@@ -586,7 +660,7 @@ def make_dis(gwf):
     dis.set_all_data_external()
     return dis
 
-def initialize_chemistry(ws, nlay, nrow, ncol):
+def initialize_chemistry(ws, nlay, nrow, ncol, sim=None, gwt_name='Cl'):
     # get chemistry
 
     solutionsdf = pd.read_csv(os.path.join(datadir,"ic_aq_chem.csv"), index_col = 0)
@@ -662,17 +736,30 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     # following original model init SI is 0
     si = 0
 
+    # Ferrihydrite as an equilibrium phase: Prommer & Stuyfzand (2005) docs/est0486768.pdf
+    # p. 2202 include "mineral equilibrium for ferrihydrite (Fe(OH)3)" in their reaction
+    # network, and Fe(OH)3 is the product of BOTH pyrite oxidation reactions, so the reference
+    # model precipitates the Fe(3) that pyrite oxidation releases. With it off, Fe(3) has no
+    # mineral sink and stays dissolved at ~2.5e-4 mol/L at pH 6.8 -- far above ferrihydrite
+    # solubility -- which is the leading explanation for the WP1 pH offset vs PHT3D.
+    # m0 = 0 in every layer of ic_surfaces.csv, so it acts as a precipitate-only sink.
+    #
+    # Ferrihydrite was absent from every pre-2026 deck only because of a bug: main's eq_dic loop
+    # re-initialised `eq_dic[ly] = {key: {}}` *inside* the per-mineral loop, so each mineral wiped
+    # the previous one and only the last (Orgmatter) survived. a42fec6 fixed that. The N and redox
+    # parameters were therefore fitted while this sink was accidentally missing -- enabling it
+    # improves the NO3/SO4 fit slightly but degrades pH (RMSE 0.158 -> 0.194), so a recalibration
+    # is outstanding.
+    # NOTE: must be matched in the PHT3D twin (pht3d_species_csv type-D rows) or the two codes
+    # are no longer comparable.
+    eq_keys = ["Ferrihydrite", "Orgmatter"]
+
     eq_dic = {}
-    #lets add pyrite first
     for ly in range(nlay):
-        for key in eq_m0.keys():
-            # create a dictionary for each layer with key as the mineral name
-            # and values as a dictionary with si and m0
-        # si followed by m0 (init moles)
-            eq_dic[ly] = {key: {}}
-            eq_dic[ly][key]['si'] = si
-            eq_dic[ly][key]['m0'] = eq_m0[key][ly]
-            # eq_dic[ly+1] = {key: [si, eq_m0[key][ly]] for key in eq_m0.keys()}
+        eq_dic[ly] = {}
+        for key in eq_keys:
+            # si followed by m0 (init moles) for each equilibrium mineral in this layer
+            eq_dic[ly][key] = {'si': si, 'm0': eq_m0[key][ly]}
     equilibriums = mup3d.EquilibriumPhases(eq_dic)
     equilibriums.set_ic(exchanger_ic)
 
@@ -711,7 +798,12 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
         # [1.0, kin_orgc_params, orgc_form, orgc_steps]
     kinetics = mup3d.KineticPhases(kin_dic)
     kinetics.set_ic(exchanger_ic)
-    model = mup3d.Mup3d('dizon36',solution, nlay, nrow, ncol)
+    if sim is not None:
+        # from_mf6: flopy builds GWF + a conservative Cl tracer GWT; mup3d clones the
+        # tracer GWT into one reactive GWT per PHREEQC component at write_simulation()
+        model = mup3d.Mup3d.from_mf6(sim, solution, name='dizon36', gwt_name=gwt_name)
+    else:
+        model = mup3d.Mup3d('dizon36',solution, nlay, nrow, ncol)
 
     # #set model workspace
     model.set_wd(ws)
@@ -767,6 +859,9 @@ def initialize_chemistry(ws, nlay, nrow, ncol):
     model.set_config(
                     reactive_timing='all',
                     reactive_externalio=True,
+                    solver_threshold=0.0,   # react every cell every step (0.3.2 'epsaqu'=0);
+                                            # 0.5.1's default 1e-10 skips near-static cells and
+                                            # freezes kinetic phases -> wrong Fe/redox
                     emulator_training_data=True,
                     emulator_target_variables=targetvars,
                     emulator_feature_variables=featvars,
@@ -1095,7 +1190,7 @@ def make_gwf(ws, model_name = "gwf", tracer = 'Cl', mup3d_m = None):
 
     return sim
 
-def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
+def make_gwt(sim, tracer = 'Cl', mup3d_m=None, write=True):
 
     gwf = sim.get_model("gwf")
     nlay = gwf.dis.nlay.get_data()
@@ -1114,7 +1209,10 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
 
     for comp in components:
         print(f"Setting transport for {comp}")
-        model_name = comp
+        # For the conservative tracer template (tracer is not None, used by from_mf6), name the
+        # model 'tracer' so it does not collide with the 'Cl' PHREEQC component that from_mf6
+        # clones. The well aux/SSM still reference `comp` (='Cl'), so the tracer follows Cl.
+        model_name = 'tracer' if tracer is not None else comp
         gwt = flopy.mf6.MFModel(
             sim,
             model_type="gwt6",
@@ -1153,7 +1251,9 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         nlay = dis.nlay.get_data()
         nrow = dis.nrow.get_data()
         ncol = dis.ncol.get_data()
-        if tracer is not None:
+        if mup3d_m is None:
+            strt = 0.0  # conservative tracer template for from_mf6; background handled by PHREEQC solutions
+        elif tracer is not None:
             strt = mup3d_m.sconc[comp]/1000 # to mmol
         else:
             strt = mup3d_m.sconc[comp]
@@ -1183,9 +1283,9 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         dsp.set_all_data_external()
 
         sourcerecarray = [
-                        ["welin", "aux", model_name],
-                        ["welout", "aux", model_name],
-                        ["chd", "aux", model_name]
+                        ["welin", "aux", comp],
+                        ["welout", "aux", comp],
+                        ["chd", "aux", comp]
                         ]
 
         ssm = flopy.mf6.ModflowGwtssm(
@@ -1244,7 +1344,8 @@ def make_gwt(sim, tracer = 'Cl', mup3d_m=None):
         )
         make_obs_pack(gwt)
 
-    sim.write_simulation() 
+    if write:
+        sim.write_simulation()
     return sim
 
 def clean_array_files(ws, files, gwf):
@@ -2073,7 +2174,8 @@ def plot_y_vs_yhat(columns,result_dict):
 
     return
 
-class PhysicsInformedLoss(tf.keras.losses.Loss):
+_LossBase = tf.keras.losses.Loss if _HAS_TF else object
+class PhysicsInformedLoss(_LossBase):
     """
     Physics-informed custom loss for geochemical surrogate models.
 
@@ -2341,7 +2443,643 @@ def surrogate_workflow(hyperparameter_tuning=False):
 
     return
 
-def main(prep_obs = True, run_base = True, 
+# =============================================================================
+# PHT3D twin (MODFLOW-2005 + MT3DMS + PHREEQC-2) — the benchmark counterpart to
+# the mf6rtm reactive model, built from the same grid, flow field and chemistry.
+# Gotchas that cost real debugging time are documented at each site below.
+# =============================================================================
+
+BIN_DIR = os.path.join('bin', 'mac' if platform.system() == 'Darwin' else 'win')
+MF2005_EXE = os.path.join(BIN_DIR, 'mf2005')
+PHT3D_EXE = os.path.join(BIN_DIR, 'pht3d')
+MF6_REACTIVE_WS = os.path.join('model', 'reactive')   # mf6rtm reference run
+PHT3D_WS = os.path.join('model', 'pht3d')
+PHT3D_NAME = 'dizon_pht3d'    # flow twin
+PHT3D_TR_NAME = 'pht3d_tr'    # transport; must differ from the flow model, else
+                              # mt.write_input() overwrites the MODFLOW name file
+POROSITY = 0.35
+
+# FSP species-table schema (dependencies/pht3d_fsp/pht3d_species.xlsx)
+_FSP_COLS = (["name", "initial_concentration", "species", "argument", "type", "mobility",
+              "ion_exchange", "exchange_stoichiometry", "exchange_master_species",
+              "surface_area", "surface_mass", "surface_phase", "surface_switch", "formula"]
+             + [f"parameter_{i:02d}" for i in range(1, 101)])
+
+# (ic_aq_chem var, fsp name, phreeqc species, mobility, argument)
+_AQUEOUS = [
+    ("O(0)", "o0", "O(0)", "mobile", None),
+    ("N(+5)", "no3", "N(5)", "mobile", None),
+    ("N(+3)", "n3", "N(3)", "mobile", None),
+    ("N(0)", "n0", "N(0)", "mobile", None),
+    ("S(6)", "so4", "S(6)", "mobile", None),
+    ("S(-2)", "s2", "S(-2)", "mobile", None),
+    ("C(+4)", "c4", "C(4)", "mobile", None),
+    ("C(-4)", "ch4", "C(-4)", "mobile", None),
+    ("Ca", "ca", "Ca", "mobile", None),
+    ("Cl", "cl", "Cl", "mobile", None),
+    ("Fe(+2)", "fe2", "Fe(2)", "mobile", None),
+    ("Fe(+3)", "fe3", "Fe(3)", "mobile", None),
+    ("K", "k", "K", "mobile", None),
+    ("Mg", "mg", "Mg", "mobile", None),
+    ("Na", "na", "Na", "mobile", None),
+    ("Si", "si", "Si", "mobile", None),
+    ("Amm", "amm", "Amm", "mobile", None),
+    ("Tmp", "tmp", "Tmp", "mobile", None),
+    # `charge` mirrors mup3d's `pH ... charge`. Tested against a plain `pH` line (what
+    # PHT3D-FSP's own example writes): indistinguishable, max |diff| 3e-4 across every
+    # variable and well, so this flag is not what drives the WP1 pH offset.
+    ("pH", "ph", "pH", "immobile", "charge"),
+    ("pe", "pe", "pe", "immobile", None),
+]
+# master species X; stoichiometry/master left blank because PHT3D reads the SAME database as
+# mf6rtm (data/datab.dat), whose EXCHANGE_SPECIES already define CaX2/FeX2/KX/MgX2/NaX
+_EXCHANGERS = [("Ca_ex", "CaX2", 2), ("Fe_ex", "FeX2", 2), ("K_ex", "KX", 1),
+               ("Mg_ex", "MgX2", 2), ("Na_ex", "NaX", 1)]
+
+
+def mf6_output_times(ws):
+    """End-of-timestep times from TDIS, one per output step (validated == MF6 totim)."""
+    sim = flopy.mf6.MFSimulation.load(sim_ws=ws, verbosity_level=0, load_only=["dis"])
+    t, out = 0.0, []
+    for perlen, nstp, tsmult in [(r[0], int(r[1]), r[2])
+                                 for r in sim.tdis.perioddata.get_data()]:
+        if tsmult == 1.0:
+            dts = [perlen / nstp] * nstp
+        else:
+            dt0 = perlen * (tsmult - 1.0) / (tsmult ** nstp - 1.0)
+            dts = [dt0 * tsmult ** i for i in range(nstp)]
+        for dt in dts:
+            t += dt
+            out.append(t)
+    return out
+
+
+def pht3d_build_flow_twin(ws=PHT3D_WS, mf6_ws=MF6_REACTIVE_WS):
+    """MODFLOW-2005 twin of the MF6 GWF, plus the LMT link file MT3DMS/PHT3D consume."""
+    sim6 = flopy.mf6.MFSimulation.load(sim_ws=mf6_ws, verbosity_level=0)
+    gwf = sim6.get_model("gwf")
+    d = gwf.dis
+    nlay, nrow, ncol = int(d.nlay.data), int(d.nrow.data), int(d.ncol.data)
+
+    npers = int(sim6.tdis.nper.data)
+    pdata = sim6.tdis.perioddata.array
+    perlen = [float(r[0]) for r in pdata]
+    nstp = [int(r[1]) for r in pdata]
+    tsmult = [float(r[2]) for r in pdata]
+
+    idomain = d.idomain.array
+    ibound = np.where(idomain > 0, 1, 0).astype(int) if idomain is not None else 1
+    npf = gwf.get_package("npf")
+    hk = npf.k.array
+    k33 = npf.k33.array if npf.k33 is not None and npf.k33.array is not None else hk
+    icelltype = np.asarray(npf.icelltype.array)
+    # MF2005 laytyp is per-LAYER; MF6 icelltype is per-cell. The model is confined
+    # (icelltype all 0), so this collapses to laytyp = 0 everywhere.
+    laytyp = np.array([1 if np.any(icelltype[k] != 0) else 0 for k in range(nlay)], dtype=int)
+    strt = gwf.get_package("ic").strt.array
+    sto = gwf.get_package("sto")
+    ss = sto.ss.array if sto.ss.array is not None else 1e-5
+    sy = sto.sy.array if sto.sy.array is not None else 0.15
+
+    os.makedirs(ws, exist_ok=True)
+    mf = flopy.modflow.Modflow(PHT3D_NAME, model_ws=ws, version="mf2005",
+                               exe_name=os.path.abspath(MF2005_EXE))
+    flopy.modflow.ModflowDis(
+        mf, nlay=nlay, nrow=nrow, ncol=ncol,
+        delr=d.delr.array, delc=d.delc.array, top=d.top.array, botm=d.botm.array,
+        nper=npers, perlen=perlen, nstp=nstp, tsmult=tsmult, steady=[False] * npers,
+        itmuni=4, lenuni=2,   # days, meters
+    )
+    flopy.modflow.ModflowBas(mf, ibound=ibound, strt=strt)
+    flopy.modflow.ModflowLpf(mf, hk=hk, vka=k33, laytyp=laytyp, ss=ss, sy=sy, ipakcb=53)
+
+    chd6 = gwf.get_package("chd").stress_period_data.get_data()
+    chd_spd = {}
+    for per, recs in chd6.items():
+        if recs is None:
+            continue
+        rows = []
+        for rec in recs:
+            lay, row, col = rec["cellid"]
+            h = float(rec["head"])
+            rows.append([lay, row, col, h, h])
+        chd_spd[int(per)] = rows
+    flopy.modflow.ModflowChd(mf, stress_period_data=chd_spd)
+
+    welin6 = gwf.get_package("welin").stress_period_data.get_data()
+    welout6 = gwf.get_package("welout").stress_period_data.get_data()
+    wel_spd = {}
+    for per in range(npers):
+        rows = []
+        for src in (welin6, welout6):
+            recs = src.get(per)
+            if recs is None:
+                continue
+            for rec in recs:
+                lay, row, col = rec["cellid"]
+                rows.append([lay, row, col, float(rec["q"])])
+        if rows:
+            wel_spd[per] = rows
+    flopy.modflow.ModflowWel(mf, stress_period_data=wel_spd, ipakcb=53)
+
+    flopy.modflow.ModflowPcg(mf, hclose=1e-7, rclose=1e-3, mxiter=200, iter1=100)
+    flopy.modflow.ModflowOc(
+        mf, stress_period_data={(p, nstp[p] - 1): ["save head", "save budget"]
+                                for p in range(npers)})
+    flopy.modflow.ModflowLmt(mf, output_file_name="mt3d_link.ftl")
+    mf.write_input()
+    return mf, gwf
+
+
+def pht3d_compare_heads(ws=PHT3D_WS, mf6_ws=MF6_REACTIVE_WS, atol=1e-2):
+    """Gate the flow twin against MF6 at matching simulation times.
+
+    The twin saves once per stress period (39) while MF6 saves every timestep (854), so the
+    files must be paired on `totim`. Pairing by index compares end-of-period heads against
+    MF6's first 39 daily steps and reports a 0.7 m mismatch that does not exist.
+    """
+    f2005 = flopy.utils.HeadFile(os.path.join(ws, f"{PHT3D_NAME}.hds"))
+    f6 = flopy.utils.HeadFile(os.path.join(mf6_ws, "gwf.hds"))
+    t6 = np.asarray(f6.get_times())
+    worst, tot, cnt = 0.0, 0.0, 0
+    for t in f2005.get_times():
+        j = int(np.argmin(np.abs(t6 - t)))
+        if abs(t6[j] - t) > 1e-6:
+            continue
+        a = np.asarray(f2005.get_data(totim=t))
+        b = np.asarray(f6.get_data(totim=t6[j]))
+        mask = np.isfinite(a) & np.isfinite(b) & (np.abs(a) < 1e29) & (np.abs(b) < 1e29)
+        dif = np.abs(a[mask] - b[mask])
+        worst = max(worst, float(dif.max()))
+        tot += float(dif.sum())
+        cnt += int(dif.size)
+    print(f"flow twin vs MF6: max|dh|={worst:.4e} mean|dh|={tot / max(1, cnt):.4e} "
+          f"(atol={atol}) -> {'PASS' if worst <= atol else 'CHECK'}")
+    return worst <= atol
+
+
+def pht3d_species_csv(ws=PHT3D_WS):
+    """Author the FSP species table from dizon36's chemistry (single source of truth).
+
+    ROW ORDER IS THE PHT3D COMPONENT ORDER (BTN sconc / SSM css / UCN numbering). PHT3D
+    numbers components in the order pht3d_ph.dat blocks are read (multic.c::mcrp_):
+    kinetic mobile (A) -> LEA aqueous (B, pH/pe last) -> kinetic immobile (C) ->
+    equilibrium minerals (D) -> exchangers (E) -> surfaces (F) -> kinetic minerals (G).
+    FSP writes ph.dat by type but keeps BTN arrays in row order, so the table must already
+    be in PHT3D's order or transport and chemistry silently mismatch.
+    """
+    aq = pd.read_csv(os.path.join(datadir, "ic_aq_chem.csv")).set_index("var")["value"]
+    surf = pd.read_csv(os.path.join(datadir, "ic_surfaces.csv"))
+    surf1 = surf[surf["layer"] == 1].set_index("var")["value"]
+    exch = pd.read_csv(os.path.join(datadir, "ic_exchanger.csv"))
+    exch1 = exch[exch["layer"] == 1].set_index("var")["value"]
+
+    rows = []
+
+    def row(**kw):
+        r = {c: np.nan for c in _FSP_COLS}
+        r.update(kw)
+        rows.append(r)
+
+    # comp 1: Orgc, kinetic mobile (type A). It is a SOLUTION_MASTER_SPECIES in datab.dat
+    # (so it is transported) AND the kinetic-rate reactant. `argument` carries m0: the rate
+    # scales with (m/m0) and PHT3D falls back to m0 = 10 when absent, so it must be the
+    # mf6rtm value (kin_dic m0 = 1.0).
+    row(name="orgc", initial_concentration=float(aq.get("Orgc", 0.0)), species="Orgc", type="A",
+        mobility="mobile", ion_exchange="no", formula="Orgc -1.0 CH2O 1.0", argument=1.0,
+        parameter_01=1.57e-9, parameter_02=1.67e-11, parameter_03=1.0e-13)
+
+    # comps 2..19: mobile aqueous (type B); comps 20-21: pH, pe (last two of the aqueous block)
+    for want_mobile in (True, False):
+        for var, name, species, mob, arg in _AQUEOUS:
+            if (mob == "mobile") != want_mobile:
+                continue
+            row(name=name, initial_concentration=float(aq.get(var, 0.0)), species=species,
+                argument=arg, type="B", mobility=mob, ion_exchange="no")
+
+    # equilibrium minerals (SI in `argument`, m0 in initial_concentration). MUST match the
+    # `eq_keys` list in initialize_chemistry -- these two are the same physical choice expressed
+    # in each code's dialect, and a mismatch makes the codes incomparable.
+    for var in ("Ferrihydrite", "Orgmatter"):
+        row(name=var.lower(), initial_concentration=float(surf1.get(var, 0.0)), species=var,
+            argument=0.0, type="D", mobility="immobile", ion_exchange="no")
+
+    # comps 23..27: ion exchangers (type E)
+    for var, sp, _stoich in _EXCHANGERS:
+        row(name=sp.lower(), initial_concentration=float(exch1.get(var, 0.0)), species=sp,
+            type="E", mobility="immobile", ion_exchange="yes")
+
+    # comp 28 (last): kinetic mineral Pyrite (type G)
+    row(name="pyrite", initial_concentration=float(surf1.get("Pyrite", 0.0)), species="Pyrite",
+        type="G", mobility="immobile", ion_exchange="no",
+        parameter_01=16.0, parameter_02=0.67, parameter_03=0.5, parameter_04=-0.11)
+
+    df = pd.DataFrame(rows, columns=_FSP_COLS)
+    out = os.path.join(ws, "pht3d_species.csv")
+    os.makedirs(ws, exist_ok=True)
+    df.to_csv(out, index=False)
+    return df, out
+
+
+def pht3d_equilibrated_exchangers(sout=os.path.join(MF6_REACTIVE_WS, "sout.csv")):
+    """Per-layer exchanger composition after PHREEQC's initial equilibration, from mf6rtm.
+
+    mf6rtm's EXCHANGE blocks carry `-equilibrate 1`, so PHREEQC redistributes the cations
+    against the background solution before transport starts. PHT3D has no equivalent step and
+    takes the listed amounts as given, which leaves its exchanger under-loaded with Fe (the raw
+    ic_exchanger.csv FeX2 is 1.567x below the equilibrated value in layers 7-12). The exchanger
+    then strips Fe(2) from solution and displaces Ca/Mg into it.
+
+    Returns {sout column: {1-based layer: mol/L water}}, or None if sout.csv is missing. The
+    first output time is one day in -- far closer to the equilibrated state than the raw values;
+    the per-layer median keeps well-adjacent cells from skewing it.
+    """
+    if not os.path.exists(sout):
+        return None
+    cols = ["MOL_CaX2", "MOL_FeX2", "MOL_KX", "MOL_MgX2", "MOL_NaX"]
+    # the first output time is the leading nlay*ncell block, so a bounded read suffices on a
+    # multi-GB sout.csv
+    s = pd.read_csv(sout, usecols=["time", "layer"] + cols, nrows=60000)
+    s = s[s["time"] == s["time"].min()]
+    med = s.groupby("layer")[cols].median()
+    return {c: med[c].to_dict() for c in cols}
+
+
+def _pht3d_rewrite_ssm(path, ssm, npers, ncomp, itype=2):
+    """Rewrite the SSM point-source records in the hybrid format PHT3D actually reads.
+
+    mt_ssm5.for reads each record as (3I10,F10.0,I10) with ADVANCE='NO' and then takes the
+    per-component concentrations list-directed from the rest of the line. flopy instead writes
+    every field fixed-width %10G with no delimiter, so a value needing 11 characters (any of the
+    7-digit background concentrations) runs into its neighbour: the integer read hits a malformed
+    token and PHT3D dies with a Fortran error termination.
+
+    `css` (the fixed F10.0 field) is written as 0 -- PHT3D only consults it when negative, which
+    flags a recirculation well; the real concentrations are the trailing list.
+    """
+    with open(path) as f:
+        head = f.readlines()[:2]   # source-type flags + MXSS
+    with open(path, "w") as f:
+        f.writelines(head)
+        for per in range(npers):
+            rows = ssm.get(per, [])
+            f.write(f"{len(rows):10d}{0:10d} # stress period {per + 1}\n")
+            for r in rows:
+                k, i, j = int(r[0]), int(r[1]), int(r[2])
+                css_all = r[5:]
+                assert len(css_all) == ncomp, f"{len(css_all)} css values, expected {ncomp}"
+                fixed = f"{k + 1:10d}{i + 1:10d}{j + 1:10d}{0.0:10.1f}{itype:10d}"
+                f.write(fixed + " " + " ".join(f"{v:.6e}" for v in css_all) + "\n")
+
+
+def pht3d_build_transport(ws=PHT3D_WS):
+    """MT3DMS/PHT3D transport deck + PHREEQC reaction file on the flow twin's FTL."""
+    import sys
+    sys.path.insert(0, os.path.join("dependencies", "pht3d_fsp"))
+    import pht3d_fsp
+
+    mf = flopy.modflow.Modflow.load(f"{PHT3D_NAME}.nam", model_ws=ws, version="mf2005",
+                                    exe_name=os.path.abspath(MF2005_EXE), verbose=False,
+                                    check=False)
+    nlay, nrow, ncol = mf.nlay, mf.nrow, mf.ncol
+    npers = mf.dis.nper
+    perlen = np.asarray(mf.dis.perlen.array, dtype=float)
+
+    spec = pht3d_fsp.create(xlsx_path=ws + "/", xlsx_name="pht3d_species.csv",
+                            nlay=nlay, nrow=nrow, ncol=ncol, pht3d_path=ws + "/")
+    order = list(spec.keys())
+    ncomp = int(pht3d_fsp.create.ncomp)
+    mcomp = int(pht3d_fsp.create.mcomp)
+
+    surf = pd.read_csv(os.path.join(datadir, "ic_surfaces.csv"))
+    exch = pd.read_csv(os.path.join(datadir, "ic_exchanger.csv"))
+    exmap = {"cax2": "Ca_ex", "fex2": "Fe_ex", "kx": "K_ex", "mgx2": "Mg_ex", "nax": "Na_ex"}
+    soutname = {"cax2": "CaX2", "fex2": "FeX2", "kx": "KX", "mgx2": "MgX2", "nax": "NaX"}
+    surfmap = {"ferrihydrite": "Ferrihydrite", "orgmatter": "Orgmatter", "pyrite": "Pyrite"}
+    equil = pht3d_equilibrated_exchangers()
+
+    # PHT3D divides immobile-species BTN values by porosity itself (verified: feeding Pyrite
+    # 0.3753 yields 1.0722 = 0.3753/0.35 in PHT3D028.UCN), whereas PHREEQC uses the numbers in
+    # mf6rtm's phinp.dat as-is. To land on the same per-litre-of-water amounts as mf6rtm:
+    #   minerals   -- mf6rtm converts vol-bulk -> vol-water, so feed the RAW vol-bulk value and
+    #                 let PHT3D do that conversion;
+    #   exchangers -- mf6rtm writes the raw value straight into EXCHANGE, so pre-multiply by
+    #                 porosity to cancel PHT3D's division.
+    # Getting this wrong left Pyrite 1/0.35 = 2.86x too abundant; its rate law contains
+    # log10(m*115), so nitrate-fed pyrite oxidation ran far too fast and NO3 came out ~10x low.
+    sconc = {}
+    for i, nm in enumerate(order):
+        arr = np.array(spec[nm], dtype=float)
+        if nm in surfmap:
+            col = surf[surf["var"] == surfmap[nm]].set_index("layer")["value"]
+            for lay in range(nlay):
+                arr[lay, :, :] = float(col.get(lay + 1, 0.0))
+        elif nm in exmap:
+            col = exch[exch["var"] == exmap[nm]].set_index("layer")["value"]
+            eqcol = (equil or {}).get(f"MOL_{soutname[nm]}")
+            for lay in range(nlay):
+                v = float(col.get(lay + 1, 0.0))
+                if eqcol is not None:   # prefer mf6rtm's post-equilibration composition
+                    v = float(eqcol.get(lay + 1, v))
+                arr[lay, :, :] = v * POROSITY
+        sconc[i + 1] = arr
+
+    mt = flopy.mt3d.Mt3dms(modelname=PHT3D_TR_NAME, model_ws=ws, version="mt3dms",
+                           exe_name=os.path.abspath(PHT3D_EXE), modflowmodel=mf,
+                           ftlfilename="mt3d_link.ftl")
+    timprs = np.cumsum(perlen)
+    sconc_kw = {"sconc": sconc[1]}
+    for ic in range(2, ncomp + 1):
+        sconc_kw[f"sconc{ic}"] = sconc[ic]
+    # icbund follows ibound: with icbund=1 in flow-inactive cells PHREEQC is handed cells
+    # holding no mass, and charge-balancing pH there diverges until the run aborts.
+    icbund = np.where(np.asarray(mf.bas6.ibound.array) > 0, 1, 0)
+    flopy.mt3d.Mt3dBtn(mt, ncomp=ncomp, mcomp=mcomp, prsity=POROSITY, icbund=icbund,
+                       species_names=order, nprs=len(timprs), timprs=timprs,
+                       tunit="D", lunit="M", munit="mol", **sconc_kw)
+    flopy.mt3d.Mt3dAdv(mt, mixelm=-1, percel=1.0)   # TVD
+    flopy.mt3d.Mt3dDsp(mt, al=0.1, trpt=0.1, trpv=0.01, dmcoef=0.0)
+    flopy.mt3d.Mt3dGcg(mt, mxiter=50, iter1=50, isolve=3, cclose=1e-6)
+
+    # Heat retardation. mf6rtm gives Tmp linear sorption (bulk_density 1850,
+    # distcoef 2.1141e-4 -> R = 1 + rhob*Kd/theta ~ 2.12), and both the Orgc and Pyrite rate
+    # laws in data/datab.dat scale by an Arrhenius factor from tot("Tmp"), so without this the
+    # twin's redox chain runs on a thermal front arriving twice too early. Every component
+    # except Tmp keeps Kd = 0. (Worth having for correctness; it moved NO3 by under 2 %.)
+    tmp_comp = order.index("tmp") + 1
+    flopy.mt3d.Mt3dRct(mt, isothm=1, ireact=0, igetsc=0, rhob=1850.0, sp1=0.0,
+                       **{f"sp1{tmp_comp}": 2.1141e-4})
+
+    # --- SSM: per-period well injection from wellin.csv, plus the extraction wells ---
+    win = pd.read_csv(os.path.join(datadir, "wellin.csv"))
+    colmap = {name: var for (var, name, sp, mob, arg) in _AQUEOUS}
+    colmap["orgc"] = "Orgc"
+    welspd = mf.wel.stress_period_data.data
+    # Extraction wells need a chemically valid source solution even though MT3DMS ignores css
+    # at a sink: PHT3D instantiates one PHREEQC solution per SSM entry, and an all-zero entry is
+    # pure water, where charge-balancing pH diverges (pH 0, 100 % charge error) and aborts the
+    # run mid-simulation. mf6rtm gives welout the background solution, so do the same. Minerals
+    # and exchangers stay 0 -- they are not part of a well's solution.
+    spec_tbl = pd.read_csv(os.path.join(ws, "pht3d_species.csv")).set_index("name")
+    background = [0.0 if spec_tbl.loc[nm, "type"] in ("D", "E", "G")
+                  else float(spec_tbl.loc[nm, "initial_concentration"]) for nm in order]
+    ssm = {}
+    for per in range(npers):
+        recs = welspd.get(per)
+        if recs is None:
+            continue
+        rows = []
+        wcsv = win[win["kper"] == per]
+        for rec in recs:
+            k, i, j, q = int(rec["k"]), int(rec["i"]), int(rec["j"]), float(rec["flux"])
+            css_all = list(background)
+            if q > 0:
+                # make_wel_in uses the layer values (1,2,3,5,7) directly as 0-based cell layer
+                # indices, so the well cell's 0-based k matches wellin.csv's 'layer' as-is.
+                lrow = wcsv[wcsv["layer"] == k]
+                if len(lrow):
+                    for idx, nm in enumerate(order):
+                        col = colmap.get(nm)
+                        if col is not None and col in lrow.columns:
+                            css_all[idx] = float(lrow[col].values[0])
+            rows.append([k, i, j, css_all[0], 2] + css_all)
+        ssm[per] = rows
+    flopy.mt3d.Mt3dSsm(mt, stress_period_data=ssm)
+
+    mt.write_input()
+    _pht3d_rewrite_ssm(os.path.join(ws, f"{PHT3D_TR_NAME}.ssm"), ssm, npers, ncomp)
+
+    # PHT3D only invokes PHREEQC if the name file has a PHC entry pointing at pht3d_ph.dat.
+    # flopy's Mt3dms writer knows nothing about the package, so without this the binary runs as
+    # plain MT3DMS and silently skips ALL chemistry.
+    nam = os.path.join(ws, f"{PHT3D_TR_NAME}.nam")
+    with open(nam) as f:
+        txt = f.read().rstrip("\n")
+    if "PHC" not in txt:
+        with open(nam, "w") as f:
+            f.write(txt + "\nPHC               64  pht3d_ph.dat\n")
+    return mt, ncomp, mcomp
+
+
+def pht3d_run(ws=PHT3D_WS, clean=True):
+    """Run the PHT3D binary (~9 min for 39 periods / 854 d)."""
+    if clean:
+        pats = ("PHT3D0", ".MAS", ".XMAS", "fort.", "MT3D.CNF", "phinp.dat", "phout.dat",
+                "phreeqc.log", "pht3d_input_check.dat")
+        for f in os.listdir(ws):
+            if any(p in f for p in pats):
+                os.remove(os.path.join(ws, f))
+    pyemu.os_utils.run(f"{os.path.relpath(os.path.abspath(PHT3D_EXE), ws)} "
+                       f"{PHT3D_TR_NAME}.nam", cwd=ws)
+
+
+def pht3d_extract(ws=PHT3D_WS, mf6_ws=MF6_REACTIVE_WS):
+    """PHT3D UCNs -> data/pht3dout.csv (time,variable,wp,value), the digitized-file schema.
+
+    Component order is the row order of pht3d_species.csv, so PHT3D0NN.UCN is component NN.
+    The mapping is cross-checked against pht3d_input_check.dat, which the binary writes while
+    parsing pht3d_ph.dat and is therefore authoritative -- a re-ordered table cannot silently
+    mislabel the output. Comparing UCN values against initial concentrations does NOT work: the
+    first output time is already past a reaction step and O(0) starts at 1e-18.
+
+    Note the unit difference: PHT3D UCNs are mol/L, MF6 GWT UCNs are mol/m3 (sout.csv mol/L).
+    """
+    spec = pd.read_csv(os.path.join(ws, "pht3d_species.csv"))
+    idx = {nm: i + 1 for i, nm in enumerate(spec["name"])}
+    spec = spec.set_index("name")
+
+    reported = {}
+    with open(os.path.join(ws, "pht3d_input_check.dat")) as f:
+        for line in f:
+            if line.startswith("Component "):
+                num, rest = line[len("Component "):].split(":", 1)
+                reported[int(num)] = rest.strip().rstrip(".").split(".")[0].strip()
+    for name in PHT3D_VARS.values():
+        comp, want, got = idx[name], str(spec.loc[name, "species"]), reported.get(idx[name])
+        if got != want:
+            raise AssertionError(
+                f"component {comp} is '{got}' per pht3d_input_check.dat but the species table "
+                f"says '{want}' ({name}) -- table order and PHT3D numbering disagree")
+
+    cells = obs_well_cells(mf6_ws)
+    rows = []
+    for var, name in PHT3D_VARS.items():
+        u = flopy.utils.UcnFile(os.path.join(ws, f"PHT3D{idx[name]:03d}.UCN"))
+        for t in u.get_times():
+            d = u.get_data(totim=t)
+            for wp, c in cells.items():
+                rows.append(dict(time=float(t), variable=var, wp=wp,
+                                 value=float(d[c["lay"], c["row"], c["col"]])))
+    df = pd.DataFrame(rows)
+    out = os.path.join(datadir, "pht3dout.csv")
+    df.to_csv(out, index=False)
+    print(f"wrote {out}: {len(df)} rows, {df['time'].nunique()} times")
+    return df
+
+
+# =============================================================================
+# Comparison figures: mf6rtm vs observations vs the PHT3D twin
+# =============================================================================
+
+VAR_LABEL = {'o0': 'DO', 'no3': 'NO3', 'so4': 'SO4', 'tic': 'TIC', 'ph': 'pH'}
+VAR_UNIT = {'o0': '(mol L$^{-1}$)', 'no3': '(mol L$^{-1}$)', 'so4': '(mol L$^{-1}$)',
+            'tic': '(mol L$^{-1}$)', 'ph': ''}
+VAR_LIMITS = {'ph': [6, 8], 'so4': [0, 1.5e-3], 'no3': [0, 5.2e-4],
+              'o0': [0, 1e-3], 'tic': [0, 0.01]}
+# data/pht3dout.csv (and the digitized file) variable -> plot variable
+PHT3D_MAP = {'DO': 'o0', 'N5': 'no3', 'S6': 'so4', 'C4': 'tic', 'pH': 'ph'}
+# plot variable -> species-table row name, for pht3d_extract
+PHT3D_VARS = {'DO': 'o0', 'N5': 'no3', 'S6': 'so4', 'C4': 'c4', 'pH': 'ph'}
+
+FIG_VARS = ['o0', 'no3', 'so4', 'tic', 'ph']
+FIG_WPS = ['wp3', 'wp2', 'wp1']
+FIG_SCREEN = 'f2'
+
+
+def obs_well_cells(mf6_ws=MF6_REACTIVE_WS, wells=('WP1', 'WP2', 'WP3'), screen='f2'):
+    """{WPn: {lay,row,col,flat1}} for each well screen, from data/obs_loc.csv."""
+    sim = flopy.mf6.MFSimulation.load(sim_ws=mf6_ws, verbosity_level=0)
+    gwf = sim.get_model("gwf")
+    nrow, ncol = int(gwf.dis.nrow.data), int(gwf.dis.ncol.data)
+    ix = GridIntersect(gwf.modelgrid)
+    obsloc = pd.read_csv(os.path.join(datadir, "obs_loc.csv"))
+    cells = {}
+    for wp in wells:
+        r = obsloc[obsloc.obsid == f"{wp}-{screen}"].iloc[0]
+        row, col = ix.intersect([(r.x, r.y)], shapetype="point").cellids[0]
+        lay = int(r.layer)
+        cells[wp] = dict(lay=lay, row=int(row), col=int(col),
+                         flat1=lay * (nrow * ncol) + int(row) * ncol + int(col) + 1)
+    return cells
+
+
+def load_mf6rtm_series(ws=MF6_REACTIVE_WS):
+    """sout.csv rows at the observation cells, tagged with well and screen.
+
+    Handles both sout.csv schemas. mf6rtm before commit 7828ece wrote `time,cell,<vars>` with a
+    0-based `cell` and stamped time as (ctime + dt) -- one timestep AHEAD of the row's state.
+    Newer versions write `time,cell,layer,row,col,<vars>` with a 1-based `cell` and the correct
+    time. Reading a legacy file without both corrections samples one cell off AND shifts every
+    curve one step right (28-35 d late in this model). See docs/mf6rtm_time_axis_bug.md.
+    """
+    sim = flopy.mf6.MFSimulation.load(sim_ws=ws, verbosity_level=0)
+    gwf = sim.get_model("gwf")
+    nrow, ncol = int(gwf.dis.nrow.data), int(gwf.dis.ncol.data)
+    ix = GridIntersect(gwf.modelgrid)
+    obsloc = pd.read_csv(os.path.join(datadir, "obs_loc.csv"))
+    flat = []
+    for obsid in obsloc.obsid.unique():
+        x, y = obsloc.loc[obsloc.obsid == obsid, ['x', 'y']].values[0]
+        cid = ix.intersect([(x, y)], shapetype="point").cellids
+        if len(cid) == 0:
+            continue
+        r, c = cid[0]
+        lay = int(obsloc.loc[obsloc.obsid == obsid, 'layer'].values[0])
+        flat.append((obsid.lower(), lay * (nrow * ncol) + r * ncol + c))
+
+    sout = pd.read_csv(os.path.join(ws, "sout.csv"))
+    sout.columns = [c.strip().lower() for c in sout.columns]
+    legacy = not all(k in sout.columns for k in ('layer', 'row', 'col'))
+    lookup = {(fi if legacy else fi + 1): oid for oid, fi in flat}
+    sout['cell'] = sout['cell'].astype(float).astype(int)
+    if legacy:
+        true_t = mf6_output_times(ws)
+        seen = list(dict.fromkeys(sout['time']))
+        if len(seen) == len(true_t):
+            sout['time'] = sout['time'].map(dict(zip(seen, true_t)))
+        else:
+            print(f"WARNING {ws}: {len(seen)} output steps vs {len(true_t)} TDIS steps; "
+                  "time axis left uncorrected")
+    sout['obsid'] = sout['cell'].map(lookup)
+    sel = sout.dropna(subset=['obsid']).copy()
+    sel['wp'] = sel['obsid'].str.extract(r'((?:wp|ip|pp)\d+)', expand=False)
+    sel['f'] = sel['obsid'].str.extract(r'(f\d+)', expand=False)
+    return sel
+
+
+def load_observations():
+    m = pd.read_csv(os.path.join(datadir, "obs_chem_cleaned.csv"))
+    m['variable'] = m['variable'].str.lower()
+    m['wp'] = m['obsid'].str.extract(r'((?:wp|ip|pp)\d+)', expand=False)
+    m['f'] = m['obsid'].str.extract(r'(f\d+)', expand=False)
+    return m
+
+
+def load_pht3d_out():
+    p = pd.read_csv(os.path.join(datadir, "pht3dout.csv"))
+    p['pvar'] = p['variable'].map(PHT3D_MAP)
+    p['wp'] = p['wp'].str.lower()
+    return p
+
+
+def plot_comparison(show_obs=True, show_pht3d=True, ws=MF6_REACTIVE_WS, out=None):
+    """5x3 panel (rows DO/NO3/SO4/TIC/pH, cols WP3/WP2/WP1) at screen f2.
+
+    mf6rtm is a solid line and observations are open circles. PHT3D is drawn as open circles when
+    it is the only thing compared against mf6rtm, but as a dashed line on the three-way figure,
+    where circles would collide with the observation markers -- there mf6rtm is also thickened so
+    the two model curves stay separable.
+    """
+    import matplotlib.ticker as mticker
+    sel = load_mf6rtm_series(ws)
+    meas = load_observations() if show_obs else None
+    pht = load_pht3d_out() if show_pht3d else None
+    if out is None:
+        tag = {(True, True): 'obs_pht3d', (True, False): 'obs', (False, True): 'pht3d'}[
+            (show_obs, show_pht3d)]
+        out = os.path.join("output", f"dizon_mf6rtm_vs_{tag}.png")
+    three_way = show_obs and show_pht3d
+
+    fig, axes = plt.subplots(len(FIG_VARS), len(FIG_WPS), figsize=(8, 8.5),
+                             sharex='col', sharey='row')
+    axes = np.atleast_2d(axes)
+    for r, var in enumerate(FIG_VARS):
+        for c, wp in enumerate(FIG_WPS):
+            ax = axes[r, c]
+            line = sel[(sel['wp'] == wp) & (sel['f'] == FIG_SCREEN)].sort_values('time')
+            ax.plot(line['time'], line[var], color='tab:blue',
+                    lw=2.2 if three_way else 1.3, label='mf6rtm')
+            if pht is not None:
+                pp = pht[(pht['wp'] == wp) & (pht['pvar'] == var)].sort_values('time')
+                if three_way:
+                    ax.plot(pp['time'], pp['value'], ls='--', color='tab:red', lw=1.3,
+                            label='PHT3D')
+                else:
+                    ax.plot(pp['time'], pp['value'], 'o', mfc='none', mec='tab:red', mew=1.1,
+                            ms=4.5, label='PHT3D')
+            if meas is not None:
+                mp = meas[(meas['wp'] == wp) & (meas['f'] == FIG_SCREEN)
+                          & (meas['variable'] == var)]
+                ax.scatter(mp['time'], mp['value'], facecolors='none', edgecolors='k',
+                           linewidths=1.1, s=22, zorder=10, label='observed')
+            ax.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
+            ax.ticklabel_format(axis='y', style='sci', scilimits=(0, 2))
+            if r == 0:
+                ax.set_title(wp.upper())
+            if c == 0:
+                ax.set_ylabel(f"{VAR_LABEL[var]} {VAR_UNIT[var]}")
+            if r == len(FIG_VARS) - 1:
+                ax.set_xlabel('Time (days)')
+            ax.set_ylim(VAR_LIMITS[var])
+            ax.set_xlim(0, 875)
+    axes[0, -1].legend(fontsize=7, loc='upper right', framealpha=0.9)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    fig.savefig(out, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"wrote {out}")
+    return out
+
+
+def make_figures(ws=MF6_REACTIVE_WS):
+    """The three comparison figures: vs data, vs PHT3D, and vs both."""
+    return [plot_comparison(show_obs=True, show_pht3d=False, ws=ws),
+            plot_comparison(show_obs=False, show_pht3d=True, ws=ws),
+            plot_comparison(show_obs=True, show_pht3d=True, ws=ws)]
+
+
+def main(prep_obs = True, run_base = True, run_base_struct=False,
+         build_pht3d=False, run_pht3d=False, extract_pht3d=False, figures=False,
          prep_pest = False, run_pest = False):
 
     if prep_obs:
@@ -2362,18 +3100,72 @@ def main(prep_obs = True, run_base = True,
 
         pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
     if run_base_struct:
-        ws = prep_model_dir(name='test')
-        sim = make_gwf_structured(ws, tracer='Cl',mup3d_m=None)
-        # pyemu.os_utils.run('mf6', cwd=sim.sim_path)
-        gwf=sim.get_model("gwf")
+        ws = prep_model_dir(name='reactive')
+        # --- flopy MF6: GWF (Cl-aux wells + CHD) + ONE conservative Cl tracer GWT ---
+        sim = make_gwf_structured(ws, tracer='Cl', mup3d_m=None, write=False)
+        sim = make_gwt(sim, tracer='Cl', mup3d_m=None, write=False)   # single Cl tracer GWT = from_mf6 template (in-memory, no mid-build write)
+        gwf = sim.get_model("gwf")
         nlay = gwf.dis.nlay.get_data()
         nrow = gwf.dis.nrow.get_data()
         ncol = gwf.dis.ncol.get_data()
-        mup3d_m=initialize_chemistry(ws, nlay, nrow, ncol)
-        tracer = None
-        sim = make_gwf_structured(ws, tracer=tracer,mup3d_m=mup3d_m)
-        sim = make_gwt(sim, tracer=tracer, mup3d_m=mup3d_m)
-        pyemu.os_utils.run('mf6rtm', cwd=sim.sim_path)
+        # dizon36's make_wel_*/make_chd store SPD as externalized pandas-backed lists whose
+        # column count is locked. mf6rtm.from_mf6 grows the well/CHD auxiliary from 1 (the Cl
+        # tracer) to ncomp (one column per PHREEQC component); the locked form rejects that
+        # ("expected 3 got 18"). Rebuild these 3 packages as fresh in-memory (resizable) lists
+        # so the aux expansion in write_simulation() succeeds. See docs/from_mf6_notes.md.
+        _stress = {'welin': flopy.mf6.ModflowGwfwel,
+                   'welout': flopy.mf6.ModflowGwfwel,
+                   'CHD': flopy.mf6.ModflowGwfchd}
+        for _pn, _cls in _stress.items():
+            _p = gwf.get_package(_pn)
+            _spd = _p.stress_period_data.get_data()
+            gwf.remove_package(_pn)
+            _cls(gwf, stress_period_data=_spd, auxiliary='Cl', pname=_pn, save_flows=True)
+        # --- attach PHREEQC chemistry via from_mf6 (clones the Cl GWT into one reactive GWT per component) ---
+        mup3d_m = initialize_chemistry(ws, nlay, nrow, ncol, sim=sim, gwt_name='tracer')
+        # --- boundary injection chemistry (reproduces make_wel_in / make_chd mapping) ---
+        # welin: 5 layers x 39 periods -> solutions 2..196 (5 per period); welout: extraction; chd: background solution 1
+        inj_idx = [list(range(i, i + 5)) for i in range(2, 197, 5)]
+        def _ncells(pkgname):
+            spd = gwf.get_package(pkgname).stress_period_data.get_data()
+            return len(spd[sorted(spd)[0]])
+        cs_welin = mup3d.ChemStress('welin', type='aux')
+        cs_welin.set_spd({per: inj_idx[per] for per in range(nper)})
+        mup3d_m.set_chem_stress(cs_welin)
+        cs_welout = mup3d.ChemStress('welout', type='aux')
+        cs_welout.set_spd([1] * _ncells('welout'))   # extraction: injected conc ignored by MF6
+        mup3d_m.set_chem_stress(cs_welout)
+        cs_chd = mup3d.ChemStress('CHD', type='aux')
+        cs_chd.set_spd([1] * _ncells('CHD'))          # background solution 1 (pname is 'CHD')
+        mup3d_m.set_chem_stress(cs_chd)
+        # --- per-component MST: Tmp is heat, and heat retards (kd = 2*ne/1850) ---
+        # from_mf6 clones ONE tracer MST into every component, so without this override the
+        # Tmp GWT loses its linear sorption and heat travels unretarded. Pyrite kinetics are
+        # temperature-dependent, so a wrong temperature field propagates into the whole
+        # redox chain. Values match make_gwt's `if comp=='Tmp'` branch.
+        mup3d_m.set_mst_override({'Tmp': {'sorption': 'Linear',
+                                          'bulk_density': 1850.0,
+                                          'distcoef': 2.1141E-04}})
+        # --- write coupled sim + run mf6rtm ---
+        mup3d_m.write_simulation()
+        pyemu.os_utils.run('mf6rtm', cwd=mup3d_m.wd)
+    if build_pht3d:
+        # PHT3D twin of the mf6rtm run in model/reactive. The flow twin is gated against MF6
+        # heads before the transport deck is built on its FTL.
+        pht3d_build_flow_twin()
+        mf = flopy.modflow.Modflow.load(f"{PHT3D_NAME}.nam", model_ws=PHT3D_WS,
+                                        version="mf2005",
+                                        exe_name=os.path.abspath(MF2005_EXE), check=False)
+        mf.run_model(silent=True)
+        pht3d_compare_heads()
+        pht3d_species_csv()
+        pht3d_build_transport()
+    if run_pht3d:
+        pht3d_run()
+    if extract_pht3d:
+        pht3d_extract()
+    if figures:
+        make_figures()
     if prep_pest:
         template_ws=os.path.join('pest','pst_template')
         org_d = os.path.join('model','test')
@@ -2395,6 +3187,10 @@ if __name__ == "__main__":
         prep_obs = False,
         run_base = False,
         run_base_struct = False,
+        build_pht3d = False,
+        run_pht3d = False,
+        extract_pht3d = False,
+        figures = False,
         prep_pest = True,
         run_pest = True
     )

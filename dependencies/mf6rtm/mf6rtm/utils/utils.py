@@ -1,0 +1,943 @@
+"""Utility helpers for mf6rtm.
+
+Unit conversions, PHREEQC input/script parsing and assembly, dataframe-to-dict
+helpers, and file/executable staging used across the package.
+"""
+import platform
+import os
+import shutil
+import pandas as pd
+import numpy as np
+
+# global variables
+endmainblock = """\nPRINT
+    -reset false
+END\n"""
+
+
+def check_phreeqcrm_status(rm, status, op):
+    """Raise a RuntimeError if a PhreeqcRM call returned an error status.
+
+    PhreeqcRM methods return IRM_RESULT ints (0 = OK, negative = error). A
+    negative status otherwise passes silently, so a ``RunFile`` that aborts
+    partway (e.g. an EQUILIBRIUM_PHASES/EXCHANGE/KINETICS block referencing an
+    entity missing from the database) never surfaces and only shows up later as
+    an opaque "initial condition ... not found". Surface it here instead.
+
+    Parameters
+    ----------
+    rm : phreeqcrm.PhreeqcRM
+        The PhreeqcRM instance the call was made on (queried for its error
+        string when the status is bad).
+    status : int or None
+        The status returned by the PhreeqcRM call.
+    op : str
+        Name of the operation, used in the error message (e.g. ``"RunFile"``).
+
+    Raises
+    ------
+    RuntimeError
+        If ``status`` is negative.
+    """
+    if status is not None and status < 0:
+        raise RuntimeError(
+            f"PhreeqcRM {op} failed (status {status}):\n{rm.GetErrorString()}"
+        )
+
+
+def flatten_list(xss):
+    """Flatten a list of lists into a single list.
+
+    Parameters
+    ----------
+    xss : list of list
+        The nested list to flatten.
+
+    Returns
+    -------
+    list
+        A single list with all inner elements in order.
+    """
+    return [x for xs in xss for x in xs]
+
+def concentration_l_to_m3(x):
+    """Convert a concentration from mol/L to mol/m3.
+
+    Parameters
+    ----------
+    x : float or array-like
+        Concentration in mol/L.
+
+    Returns
+    -------
+    float or array-like
+        Concentration in mol/m3 (``x * 1e3``).
+    """
+    c = x * 1e3
+    return c
+
+def concentration_m3_to_l(x):
+    """Convert a concentration from mol/m3 to mol/L.
+
+    Parameters
+    ----------
+    x : float or array-like
+        Concentration in mol/m3.
+
+    Returns
+    -------
+    float or array-like
+        Concentration in mol/L (``x * 1e-3``).
+    """
+    c = x * 1e-3
+    return c
+
+def concentration_to_massrate(q, conc):
+    """Calculate mass rate from volumetric flow rate and concentration.
+
+    Parameters
+    ----------
+    q : float or array-like
+        Volumetric flow rate (L3/T).
+    conc : float or array-like
+        Concentration (M/L3).
+
+    Returns
+    -------
+    float or array-like
+        Mass rate (M/T), computed as ``q * conc``.
+    """
+    mrate = q * conc  # M/T
+    return mrate
+
+def concentration_volbulk_to_volwater(conc_volbulk, porosity):
+    """Convert a bulk-volume concentration to a pore-water concentration.
+
+    Parameters
+    ----------
+    conc_volbulk : float or array-like
+        Concentration per unit bulk volume.
+    porosity : float or array-like
+        Porosity used to rescale to pore-water volume.
+
+    Returns
+    -------
+    float or array-like
+        Concentration per unit pore-water volume (``conc_volbulk / porosity``).
+    """
+    conc_volwater = conc_volbulk * (1 / porosity)
+    return conc_volwater
+
+def add_charge_flag_to_species_in_solution(script: str, species: list[str] = ["pH"]) -> str:
+    """Add the ``charge`` flag to species lines inside SOLUTION blocks.
+
+    Parameters
+    ----------
+    script : str
+        PHREEQC input script text.
+    species : list of str, optional
+        Species whose lines inside ``SOLUTION`` blocks receive the ``charge``
+        flag. Default is ``["pH"]``.
+
+    Returns
+    -------
+    str
+        The modified script with ``charge`` appended to matching lines.
+    """
+    lines = script.splitlines()
+    modified_lines = []
+
+    inside_solution = False
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.upper().startswith("SOLUTION"):
+            inside_solution = True
+        elif stripped.upper().startswith("END"):
+            inside_solution = False
+
+        # Only modify if we're inside a SOLUTION block
+        if inside_solution:
+            for target in species:
+                if stripped.startswith(target):
+                    if "charge" not in stripped:
+                        line = line.rstrip() + " charge"
+                    break
+
+        modified_lines.append(line)
+
+    return "\n".join(modified_lines)
+
+def solution_csv_to_dict(csv_file, header=True):
+    """Read a solution CSV file and convert it to a dictionary
+    Parameters
+    ----------
+    csv_file : str
+        The path to the solution CSV file.
+    header : bool, optional
+        Whether the CSV file has a header. The default is True.
+    Returns
+    -------
+    data : dict
+        A dictionary with the first column as keys and the remaining columns as values.
+    """
+    # Read the CSV file and convert it to a dictionary using first row as keys and columns as value (array of shape ncol)
+    import csv
+
+    with open(csv_file, mode="r") as infile:
+        reader = csv.reader(infile)
+        # skip header assuming first line is header
+        if header:
+            next(reader)
+
+        data = {
+            rows[0]: [float(i) for i in rows[1:]]
+            for rows in reader
+            if not rows[0].startswith("#")
+        }
+        # data = {rows[0]: rows[1:] for rows in reader if rows[0].startswith('#') == False}
+
+        # for key, value in data.items():
+        #     data[key] = [float(i) for i in value]
+    return data
+
+# def kinetics_df_to_dict(data, header=True):
+#     """Read a kinetics CSV file and convert it to a dictionary
+#     Parameters
+#     ----------
+#     csv_file : str
+#         The path to the kinetics CSV file.
+#     header : bool, optional
+#         Whether the CSV file has a header. The default is True.
+#     Returns
+#     -------
+#     data : dict
+#         A dictionary with the first column as keys and the remaining columns as values.
+#     """
+#     dic = {}
+#     # data.set_index(data.columns[0], inplace=True)
+#     par_cols = [col for col in data.columns if col.startswith("par")]
+#     for key in data.index:
+#         parms = [item for item in data.loc[key, par_cols] if not pd.isna(item)]
+#         # print(parms)
+#         dic[key] = [
+#             item
+#             for item in data.loc[key]
+#             if item not in parms and not pd.isna(item)
+#         ]
+#         dic[key].append(parms)
+#     return dic
+
+
+def solution_df_to_dict(data, header=True):
+    """Convert a pandas DataFrame to a dictionary
+    Parameters
+    ----------
+    data : pandas.DataFrame
+        The DataFrame to convert.
+    header : bool, optional
+        Whether the DataFrame has a header. The default is True.
+    Returns
+    -------
+    data : dict
+        A dictionary with the first column as keys and the remaining columns as values.
+    """
+    data = data.T.to_dict("list")
+    for key, value in data.items():
+        data[key] = [float(i) for i in value]
+    return data
+
+# def equilibrium_phases_csv_to_dict(csv_file, header=True):
+#     """Read an equilibrium phases CSV file and convert it to a dictionary
+#     Parameters
+#     ----------
+#     csv_file : str
+#         The path to the equilibrium phases CSV file.
+#     header : bool, optional
+#         Whether the CSV file has a header. The default is True.
+#     Returns
+#     -------
+#     data : dict
+#         A dictionary with phase names as keys and lists of saturation indices and amounts as values.
+#     """
+#     df=pd.read_csv(csv_file)
+#     import csv
+
+#     with open(csv_file, mode="r") as infile:
+#         reader = csv.reader(infile)
+#         # skip header assuming first line is header
+#         if header:
+#             next(reader)
+#         data = {}
+#         for row in reader:
+#             if row[0].startswith("#"):
+#                 continue
+#             if int(row[-1]) not in data:
+#                 # data[row[0]] = [[float(row[1]), float(row[2])]]
+#                 data[int(row[-1])] = {row[0]: [float(row[1]), float(row[2])]}
+#             else:
+#                 # data[int(row[-1])] # append {row[0]: [float(row[1]), float(row[2])]} to the existing nested dictionary
+#                 data[int(row[-1])][row[0]] = [float(row[1]), float(row[2])]
+#     return data
+
+def surfaces_csv_to_dict(csv_file, header=True):
+    """Read an equilibrium phases CSV file and convert it to a dictionary
+    Parameters
+    ----------
+    csv_file : str
+        The path to the equilibrium phases CSV file.
+    header : bool, optional
+        Whether the CSV file has a header. The default is True.
+    Returns
+    -------
+    data : dict
+        A dictionary with phase names as keys and lists of saturation indices and amounts as values.
+    """
+    import csv
+
+    with open(csv_file, mode="r") as infile:
+        reader = csv.reader(infile)
+        # skip header assuming first line is header
+        if header:
+            next(reader)
+        data = {}
+        for row in reader:
+            if row[0].startswith("#"):
+                continue
+            if int(row[-1]) not in data:
+                # data[row[0]] = [[float(row[1]), float(row[2])]]
+                data[int(row[-1])] = {row[0]: [i for i in row[1:-1]]}
+            else:
+                # data[int(row[-1])] # append {row[0]: [float(row[1]), float(row[2])]} to the existing nested dictionary
+                data[int(row[-1])][row[0]] = [i for i in row[1:-1]]
+    return data
+
+def parse_equilibriums_dataframe(df, columns=None):
+    """
+    Convert a DataFrame of equilibrium phases into a nested dictionary.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The input DataFrame.
+    columns : list of str, optional
+        List of column names in the following order:
+        [phase, sat_index, conc_mol_lb, num].
+        Default: ['phase', 'sat_index', 'conc_mol_lb', 'num']
+        num corresponds to the block number
+
+    Returns
+    -------
+    dict
+        Dictionary structured as {zone: {phase: {'si': val, 'm0': val}}}
+    """
+    if columns is None:
+        columns = ['phase', 'sat_index', 'conc_mol_lb', 'num']
+
+    phase_col, si_col, moles_col, zone_col = columns
+
+    equ_phases = {}
+    for _, row in df.iterrows():
+        zone = row[zone_col]
+        if zone not in equ_phases:
+            equ_phases[zone] = {}
+        equ_phases[zone][row[phase_col]] = {
+            "si": row[si_col],
+            "m0": row[moles_col],
+        }
+
+    return equ_phases
+
+def parse_kinetics_dataframe(df, optional_fields=["formula", "steps"]):
+    """
+    Convert a DataFrame of kinetic phase data into a nested dictionary to import into mup3d.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must include 'm0', 'parm1'-'parm4', 'num', and either 'phase' or 'name'.
+    optional_fields : list of str, optional
+        List of optional columns to include if present and non-NaN.
+
+    Returns
+    -------
+    dict
+        Nested dictionary like:
+        {
+            1: {
+                "Calcite": {
+                    "m0": 4.0,
+                    "parms": [100.0, 0.6],
+                    "formula": "Calcite -1.0 Ca 1.0 C -1.0",
+                    ...
+                },
+                ...
+            }
+        }
+    """
+    df.columns = df.columns.str.strip()
+
+    if optional_fields is None:
+        optional_fields = ["formula", "steps", "tol", "phase_type"]
+
+    # Find name column
+    name_col = next((col for col in ["phase", "name"] if col in df.columns), None)
+    if name_col is None:
+        raise ValueError("Expected a 'phase' or 'name' column in the DataFrame.")
+
+    phases = {}
+
+    for _, row in df.iterrows():
+        zone = int(row["num"])
+        species_name = row[name_col]
+
+        if zone not in phases:
+            phases[zone] = {}
+
+        # Parse m0
+        m0 = float(row["m0"])
+
+        # Parse parms (skip NaN)
+        parms = [
+            float(row[col]) for col in ["parm1", "parm2", "parm3", "parm4"]
+            if col in df.columns and not pd.isna(row[col])
+        ]
+
+        # Build entry
+        entry = {
+            "m0": m0,
+            "parms": parms
+        }
+
+        # Add optional fields
+        for field in optional_fields:
+            if field in df.columns:
+                val = row[field]
+                if not pd.isna(val):
+                    entry[field] = val if not isinstance(val, float) else float(val)
+
+        phases[zone][species_name] = entry
+
+    return phases
+
+# def kinetics_phases_csv_to_dict(csv_file, header=True):
+#     """Read an kinetic phases CSV file and convert it to a dictionary
+#     Parameters
+#     ----------
+#     csv_file : str
+#         The path to the equilibrium phases CSV file.
+#     header : bool, optional
+#         Whether the CSV file has a header. The default is True.
+#     Returns
+#     -------
+#     data : dict
+#         A dictionary with phase names as keys and lists of saturation indices and amounts as values.
+#     """
+#     df = pd.read(csv_file)
+#     import csv
+
+#     with open(csv_file, mode="r") as infile:
+#         reader = csv.reader(infile)
+#         # skip header assuming first line is header
+#         if header:
+#             cols = next(reader)
+#         data = {}
+#         for row in reader:
+#             if row[0].startswith("#"):
+#                 continue
+#             rowcleaned = [i for i in row if i != ""]
+#             if int(rowcleaned[-1]) not in data:
+#                 # data[row[0]] = [[float(row[1]), float(row[2])]]
+#                 data[int(rowcleaned[-1])] = {rowcleaned[0]: [float(rowcleaned[1])]}
+#                 data[int(rowcleaned[-1])][rowcleaned[0]].append(
+#                     [float(i) for i in rowcleaned[2:-1]]
+#                 )
+#             else:
+#                 data[int(rowcleaned[-1])][rowcleaned[0]] = [float(rowcleaned[1])]
+#                 data[int(rowcleaned[-1])][rowcleaned[0]].append(
+#                     [float(i) for i in rowcleaned[2:-1]]
+#                 )
+#                 # [float(i) for i in rowcleaned[1:-1]]
+#     return data
+
+
+def handle_block(current_items, block_generator, i, *args, **kwargs):
+    """Generate a block for a PHREEQC input script if the current items are not empty
+    Parameters
+    ----------
+    current_items : list
+        A list of items to include in the block.
+    block_generator : function
+        A function that generates the block.
+    i : int
+        The block number.
+    Returns
+    -------
+    script : str
+        The block as a string.
+    """
+    # temp = kwargs.get('temp')  # Safely get 'temp' if it exists, else returns None
+    # water = kwargs.get('water')
+
+    script = ""
+    script += block_generator(current_items, i, *args, **kwargs)
+    return script
+
+def get_compound_names(database_file, block="SOLUTION_MASTER_SPECIES"):
+    """Get a list of compound names from a PHREEQC database file
+    Parameters
+    ----------
+    database_file : str
+        The path to the PHREEQC database file.
+    block : str, optional
+        The keyword for the block containing the compound names. The default is 'SOLUTION_MASTER_SPECIES'.
+    Returns
+    -------
+    compound_names : list
+        A list of compound names.
+    """
+    species_names = []
+    with open(database_file, "r", errors="replace") as db:
+        lines = db.readlines()
+        in_block = False
+        for line in lines:
+            if block.upper() in line:
+                in_block = True
+            elif (
+                in_block
+                and line.strip().isupper()
+                and len(line.strip()) > 1
+                and "_" in line.strip()
+            ):  # Stop when encountering the next keyword
+                in_block = False
+            elif in_block:
+                if (
+                    line.strip()
+                    and not line.startswith("#")
+                    and line.split()[0][0].isupper()
+                ):  # Ignore empty lines and comments
+                    species = line.split()[
+                        0
+                    ]  # The species name is the first word on the line
+                    species_names.append(species)
+                if (
+                    line.strip()
+                    and not line.startswith("#")
+                    and line.split()[0][0].isupper()
+                    and block.startswith("EXCHANGE")
+                ):
+                    # Ignore empty lines and comments
+                    species = line.split()[
+                        -1
+                    ]  # The exchange species are the last word on the line
+                    species_names.append(species)
+    return species_names
+
+def map_species_property_to_grid(data_dict, ic_array, species, property_key):
+    """
+    Create an array matching ic_array shape with a selected property
+    (e.g., 'moles', 'si') of a given species from a zone-indexed dictionary.
+
+    Parameters
+    ----------
+    data_dict : dict
+        Format: {zone_idx (int): {species_name (str): {key: value, ...}}}
+    ic_array : np.ndarray
+        1-indexed zone allocation array of shape (nlay, nrow, ncol).
+    species : str
+        Species name to extract (e.g., 'Goethite').
+    property_key : str
+        Property to extract for the species (e.g., 'moles', 'si').
+
+    Returns
+    -------
+    np.ndarray
+        Array of same shape as ic_array filled with the extracted property values.
+
+    Raises
+    ------
+    KeyError
+        If the species or property_key is missing in any zone where it's expected.
+    """
+    output = np.zeros_like(ic_array, dtype=float)
+
+    for zone_idx, species_dict in data_dict.items():
+        if species not in species_dict:
+            raise KeyError(f"Species '{species}' not found in block id {zone_idx}")
+        if property_key not in species_dict[species]:
+            raise KeyError(f"Property '{property_key}' not found for species '{species}' in block id {zone_idx}")
+
+        value = species_dict[species][property_key]
+        output[ic_array == (zone_idx + 1)] = value
+
+    return output
+
+# def generate_exchange_block(exchange_dict, i, equilibrate_solutions=[]):
+#     """Generate an EXCHANGE block for PHREEQC input script
+#     Parameters
+#     ----------
+#     exchange_dict : dict
+#         A dictionary with species names as keys and exchange concentrations as values.
+#     i : int
+#         The block number.
+#     Returns
+#     -------
+#     script : str
+#         The EXCHANGE block as a string.
+#     """
+#     script = f"EXCHANGE {i+1}\n"
+#     for species, conc in exchange_dict.items():
+#         script += f"    {species} {conc:.5e}\n"
+#     if len(equilibrate_solutions) > 0:
+#         script += f"    -equilibrate {equilibrate_solutions[i]}"
+#     else:
+#         script += f"    -equilibrate {1}"
+#     script += "\nEND\n"
+#     return script
+
+def generate_exchange_block(phases_dict, i, equilibrate_solutions=1):
+    """Generate an EXCHANGE block for PHREEQC input script
+    Parameters
+    ----------
+    exchange_dict : dict
+        A dictionary with species names as keys and exchange concentrations as values.
+    i : int
+        The block number.
+    Returns
+    -------
+    script : str
+        The EXCHANGE block as a string.
+    """
+    script = ""
+    script += f"EXCHANGE {i+1}\n"
+    for name, values in phases_dict.items():
+        moles = values['m0']
+        script += f"    {name} {moles:.5e}\n"
+    script += f"    -equilibrate {equilibrate_solutions}\n"
+    script += "END\n"
+    return script
+
+def generate_surface_block(surface_dict, i, equilibrate_solutions=1, options=[]):
+    """Generate a SURFACE block for PHREEQC input script
+    Parameters
+    ----------
+    surface_dict : dict
+        A dictionary with surface names as keys and lists of site densities and site densities as values.
+    i : int
+        The block number.
+    equilibrate_solutions : int, optional
+        Solution number this surface is equilibrated with. Default is 1.
+    Returns
+    -------
+    script : str
+        The SURFACE block as a string.
+    """
+    script = f"SURFACE {i+1}\n"
+    for name, values in surface_dict.items():
+        script += f"    {name}"
+        script += "    " + " ".join(f"{v}" for v in values) + "\n"
+        script += f"    -equilibrate {equilibrate_solutions}\n"
+        if len(options) > 0:
+            for i in range(len(options)):
+                script += f"    -{options[i]}\n"
+            # script += f"    -{options[i]}\n"
+        # script += f"    -no_edl\n"
+    script += "END\n"
+    return script
+
+# def generate_kinetics_block(kinetics_dict, i):
+#     """Generate a KINETICS block for PHREEQC input script
+#     Parameters
+#     ----------
+#     kinetics_dict : dict
+#         A dictionary with species names as keys and lists of rate constants and exponents as values.
+#     i : int
+#         The block number.
+#     Returns
+#     -------
+#     script : str
+#         The KINETICS block as a string.
+#     """
+#     script = f"KINETICS {i+1}\n"
+#     options = ["m0", "parms", "formula", "steps"]
+#     for species, values in kinetics_dict.items():
+#         script += f"    {species}\n"
+#         for k in range(len(values)):
+#             if isinstance(values[k], list):
+#                 script += (
+#                     f"        -{options[k]} "
+#                     + " ".join(f"{parm:.5e}" for parm in values[k])
+#                     + "\n"
+#                 )
+#             elif isinstance(values[k], str):
+#                 script += f"        -{options[k]} {values[k]}\n"
+#             else:
+#                 script += f"        -{options[k]} {values[k]:.5e}\n"
+#     script += "\nEND\n"
+#     return script
+
+def generate_kinetics_block(kinetics_dict, i):
+    """
+    Generate a KINETICS block for PHREEQC input script.
+
+    Parameters
+    ----------
+    kinetics_dict : dict
+        Dictionary structured like:
+        {
+            "Pyrite": {
+                "m0": [0.04],
+                "parms": [3.42, 0.0, 0.5, 0.0],
+                "formula": "Pyrite -1.0 Fe 1.0 S -1.0"
+            },
+            ...
+        }
+
+    i : int
+        The block number.
+
+    Returns
+    -------
+    script : str
+        The KINETICS block as a string.
+    """
+    script = f"KINETICS {i+1}\n"
+    for species, fields in kinetics_dict.items():
+        script += f"    {species}\n"
+        for key, val in fields.items():
+            if isinstance(val, list):
+                script += f"        -{key} " + " ".join(f"{v:.5e}" for v in val) + "\n"
+            elif isinstance(val, (int, float)):
+                script += f"        -{key} {val:.5e}\n"
+            else:  # assume string
+                script += f"        -{key} {val}\n"
+    script += "END\n"
+    return script
+
+# def generate_phases_block(phases_dict, i):
+#     """Generate an EQUILIBRIUM_PHASES block for PHREEQC input script
+#     Parameters
+#     ----------
+#     phases_dict : dict
+#         A dictionary with phase names as keys and lists of saturation indices and amounts as values.
+#     i : int
+#         The block number.
+#     Returns
+#     -------
+#     script : str
+#         The EQUILIBRIUM_PHASES block as a string.
+#     """
+#     script = ""
+#     script += f"EQUILIBRIUM_PHASES {i+1}\n"
+#     for name, values in phases_dict.items():
+#         saturation_index, amount = values
+#         script += f"    {name} {saturation_index:.5e} {amount:.5e}\n"
+#     script += "\nEND\n"
+#     return script
+
+def generate_equ_phases_block(phases_dict, i):
+    """Generate an EQUILIBRIUM_PHASES block for PHREEQC input script
+    Parameters
+    ----------
+    phases_dict : dict
+        A dictionary with phase names as keys and lists of saturation indices and amounts as values.
+    i : int
+        The block number.
+    Returns
+    -------
+    script : str
+        The EQUILIBRIUM_PHASES block as a string.
+    """
+    script = ""
+    script += f"EQUILIBRIUM_PHASES {i+1}\n"
+    for name, values in phases_dict.items():
+        saturation_index = values['si']
+        moles = values['m0']
+        script += f"    {name} {saturation_index:.5e} {moles:.5e}\n"
+    script += "END\n"
+    return script
+
+def generate_solution_block(species_dict, i, temp=25.0, water=1.0):
+    """Generate a SOLUTION block for PHREEQC input script
+    Parameters
+    ----------
+    species_dict : dict
+        A dictionary with species names as keys and concentrations as values.
+    i : int
+        The solution number.
+    temp : float, optional
+        The temperature of the solution in degrees Celsius. The default is 25.0.
+    water : float, optional
+        The mass of water in kg. The default is 1.0.
+    Returns
+    -------
+    script : str
+        The SOLUTION block as a string.
+    """
+    if isinstance(temp, (int, float)):
+        t = f"{temp:.1f}"
+    elif isinstance(temp, list):
+        t = f"{temp[i]}"
+    script = f"SOLUTION {i+1}\n"
+    script += f"""   units mol/kgw
+    water {water}
+    temp {t}\n"""
+    for species, concentration in species_dict.items():
+        script += f"    {species} {concentration:.5e}\n"
+    script += "\nEND\n"
+    return script
+
+
+def rearrange_copy_blocks(script):
+    """Move all ``COPY`` lines to the end of a PHREEQC script.
+
+    Parameters
+    ----------
+    script : str
+        PHREEQC input script.
+
+    Returns
+    -------
+    str
+        The script with every ``COPY`` line moved after all other lines.
+    """
+    # Split the script into lines
+    lines = script.split("\n")
+    copy_blocks = []
+    # end_blocks = []
+    other_blocks = []
+
+    # Separate the lines into COPY blocks, END blocks, and other blocks
+    for line in lines:
+        if line.startswith("COPY"):
+            copy_blocks.append(line)
+        else:
+            other_blocks.append(line)
+
+    # Combine the blocks, putting the COPY blocks at the end and avoiding consecutive END blocks
+    rearranged_script = []
+    for block in other_blocks + copy_blocks:
+        rearranged_script.append(block)
+
+    # Join the lines back together into a single script string
+    rearranged_script = "\n".join(rearranged_script)
+
+    return rearranged_script
+
+def prep_bins(dest_path, src_path=os.path.join("bin"), get_only=[], add_platform=True):
+    """Copy executables from the source path to the destination path.
+
+    Parameters
+    ----------
+    dest_path : str
+        Destination directory for the copied files.
+    src_path : str, optional
+        Source directory containing the binaries. Default is ``"bin"``.
+    get_only : list of str, optional
+        If non-empty, only copy files whose base name (before the first ``.``)
+        is in this list. Default is an empty list (copy all).
+    add_platform : bool, optional
+        If True, append the platform subdirectory (``linux``/``mac``/``win``)
+        to ``src_path``. Default is True.
+
+    Returns
+    -------
+    list of str
+        Sorted names of the files that were copied.
+    """
+
+    if add_platform:
+        if "linux" in platform.platform().lower():
+            bin_path = os.path.join(src_path, "linux")
+        elif (
+            "darwin" in platform.platform().lower()
+            or "macos" in platform.platform().lower()
+        ):
+            bin_path = os.path.join(src_path, "mac")
+        else:
+            bin_path = os.path.join(src_path, "win")
+    else:
+        bin_path = src_path
+    files = os.listdir(bin_path)
+    if len(get_only) > 0:
+        files = [f for f in files if f.split(".")[0] in get_only]
+
+    for f in files:
+        if os.path.exists(os.path.join(dest_path, f)):
+            try:
+                os.remove(os.path.join(dest_path, f))
+            except IOError:
+                continue
+        shutil.copy2(os.path.join(bin_path, f), os.path.join(dest_path, f))
+    return sorted(files)
+
+def get_indices(element, lst):
+    """Return the indices of all occurrences of a value in a list.
+
+    Parameters
+    ----------
+    element : Any
+        Value to search for.
+    lst : list
+        List to search.
+
+    Returns
+    -------
+    list of int
+        Indices at which ``element`` occurs in ``lst``.
+    """
+    return [i for i, x in enumerate(lst) if x == element]
+
+def fill_missing_minerals(data_dict):
+    """Fill missing minerals in all zones with zero parameters.
+
+    Parameters
+    ----------
+    data_dict : dict
+        Dictionary with zone indices as keys and mineral dictionaries as values.
+        Each mineral dictionary contains parameter names and values.
+
+    Returns
+    -------
+    dict
+        Updated dictionary with all minerals present in all zones.
+
+    Examples
+    --------
+    >>> data_dict = {
+    ...     0: {'Goethite': {'m0': 1.0, 'si': 0.9}},
+    ...     1: {'Pyrite': {'m0': 2.0, 'si': 1.8}}
+    ... }
+    >>> filled = fill_missing_minerals(data_dict)
+    >>> filled[0]['Pyrite']  # Now exists with zeros
+    {'m0': 0.0, 'si': 0.0}
+    """
+    # Collect all unique minerals across all zones
+    all_minerals = set()
+    for zone_dict in data_dict.values():
+        all_minerals.update(zone_dict.keys())
+
+    # Collect all unique parameters for each mineral
+    mineral_params = {}
+    for zone_dict in data_dict.values():
+        for mineral, params in zone_dict.items():
+            if mineral not in mineral_params:
+                mineral_params[mineral] = set(params.keys())
+            else:
+                mineral_params[mineral].update(params.keys())
+
+    # Fill in missing minerals and parameters
+    for zone_idx in data_dict.keys():
+        for mineral in all_minerals:
+            if mineral not in data_dict[zone_idx]:
+                # Mineral doesn't exist in this zone, add it with zeros
+                data_dict[zone_idx][mineral] = {
+                    param: 0.0 for param in mineral_params[mineral]
+                }
+            else:
+                # Mineral exists, but check if all parameters are present
+                for param in mineral_params[mineral]:
+                    if param not in data_dict[zone_idx][mineral]:
+                        data_dict[zone_idx][mineral][param] = 0.0
+
+    return data_dict
