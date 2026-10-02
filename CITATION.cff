@@ -6,6 +6,7 @@ license: BSD-3-Clause
 repository-code: "https://github.com/p-ortega/dizon36"
 version: "1.0.0"
 date-released: "2026-10-02"
+doi: "10.5281/zenodo.23095990"
 authors:
   - family-names: Ortega-Tong
     given-names: Pablo
