@@ -1,0 +1,41 @@
+{
+  "title": "Dizon 36: a reactive transport benchmark of mf6rtm against PHT3D",
+  "upload_type": "software",
+  "description": "Sandbox reactive transport model of the Dizon deep well injection experiment (Prommer and Stuyfzand, 2005), built to benchmark mf6rtm (MODFLOW 6 GWT coupled to PhreeqcRM) against PHT3D, and to explore decision-support workflows for reactive transport with machine-learning surrogates. Code is BSD-3-Clause; data and figures in data/ and output/ are CC-BY-4.0.",
+  "creators": [
+    {
+      "name": "Ortega-Tong, Pablo",
+      "orcid": "0000-0003-4091-4221",
+      "affiliation": "INTERA Geosciences"
+    },
+    {
+      "name": "Hugman, Rui",
+      "orcid": "0000-0003-0891-3886",
+      "affiliation": "INTERA Geosciences"
+    }
+  ],
+  "license": "BSD-3-Clause",
+  "access_right": "open",
+  "keywords": [
+    "reactive transport",
+    "MODFLOW 6",
+    "PhreeqcRM",
+    "mf6rtm",
+    "PHT3D",
+    "deep well injection"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "10.1021/es0486768",
+      "relation": "references",
+      "scheme": "doi",
+      "resource_type": "publication-article"
+    },
+    {
+      "identifier": "https://github.com/p-ortega/mf6rtm",
+      "relation": "requires",
+      "scheme": "url",
+      "resource_type": "software"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use this model, please cite it as below."
+title: "Dizon 36: a reactive transport benchmark of mf6rtm against PHT3D"
+type: software
+license: BSD-3-Clause
+repository-code: "https://github.com/p-ortega/dizon36"
+version: "1.0.0"
+date-released: "2026-10-02"
+authors:
+  - family-names: Ortega-Tong
+    given-names: Pablo
+    orcid: "https://orcid.org/0000-0003-4091-4221"
+    affiliation: "INTERA Geosciences"
+  - family-names: Hugman
+    given-names: Rui
+    orcid: "https://orcid.org/0000-0003-0891-3886"
+    affiliation: "INTERA Geosciences"
+keywords:
+  - reactive transport
+  - MODFLOW 6
+  - PhreeqcRM
+  - mf6rtm
+  - PHT3D
+  - deep well injection
+references:
+  - type: article
+    title: "Identification of Temperature-Dependent Water Quality Changes during a Deep Well Injection Experiment in a Pyritic Aquifer"
+    authors:
+      - family-names: Prommer
+        given-names: Henning
+      - family-names: Stuyfzand
+        given-names: Pieter J.
+    journal: "Environmental Science & Technology"
+    volume: 39
+    issue: 7
+    start: 2200
+    end: 2209
+    year: 2005
+    doi: "10.1021/es0486768"
