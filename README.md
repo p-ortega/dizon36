@@ -1,5 +1,7 @@
 # DIZON 36
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23095990.svg)](https://doi.org/10.5281/zenodo.23095990)
+
 **Dizon 36** is a sandbox reactive transport model built to benchmark the
 [`mf6rtm`](https://github.com/p-ortega/mf6rtm) code (MODFLOW 6 GWT coupled to PhreeqcRM) against
 [PHT3D](https://www.pht3d.org) (MODFLOW-2005 + MT3DMS + PHREEQC-2), and to explore
