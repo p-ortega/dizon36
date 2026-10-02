@@ -13,8 +13,6 @@ The model reproduces the **Dizon deep well injection experiment** in the Netherl
 > Changes during a Deep Well Injection Experiment in a Pyritic Aquifer.* Environmental Science &
 > Technology **39**(7), 2200–2209. [doi:10.1021/es0486768](https://doi.org/10.1021/es0486768)
 
-(paper and supporting information in [`docs/`](docs/)).
-
 Two Dutch water companies tested deep well recharge of canal water to combat groundwater
 drawdown and restore wetlands. A pilot plant on the Zuid-Willemsvaart canal near Someren
 injected pretreated, **aerobic** surface water at ~300 m depth into an **anoxic, pyritic**
