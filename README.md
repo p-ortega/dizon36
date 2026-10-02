@@ -92,17 +92,19 @@ against mf6rtm alone. Rows are DO / NO₃ / SO₄ / TIC / pH; columns are WP3 / 
 
 ## Workflow
 
-Everything runs from `workflow.py`, controlled by boolean flags on `main()`:
+Everything runs from `workflow.py`, controlled by boolean flags on `main()`. `python workflow.py`
+builds and runs the structured mf6rtm model and writes the three figures above. That run takes
+about 35 minutes and writes a 2.9 GB `model/reactive/sout.csv`.
 
 ```python
 main(
-    prep_obs        = True,   # clean the raw observation CSVs
-    run_base        = True,   # build + run the unstructured mf6rtm model
-    run_base_struct = False,  # build + run the structured mf6rtm model (model/reactive)
+    prep_obs        = False,  # clean the raw observation CSVs
+    run_base        = False,  # build + run the unstructured mf6rtm model
+    run_base_struct = True,   # build + run the structured mf6rtm model (model/reactive)
     build_pht3d     = False,  # PHT3D twin: MF2005 flow twin + FTL, species table, MT3DMS deck
     run_pht3d       = False,  # run the PHT3D binary (~9 min)
     extract_pht3d   = False,  # PHT3D UCNs -> data/pht3dout.csv
-    figures         = False,  # write the three comparison figures above
+    figures         = True,   # write the three comparison figures above
     prep_pest       = False,  # prepare the PEST++ setup
     run_pest        = False,  # run PEST++
 )

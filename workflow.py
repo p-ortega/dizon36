@@ -3186,12 +3186,12 @@ if __name__ == "__main__":
     main(
         prep_obs = False,
         run_base = False,
-        run_base_struct = False,
+        run_base_struct = True,
         build_pht3d = False,
         run_pht3d = False,
         extract_pht3d = False,
-        figures = False,
-        prep_pest = True,
-        run_pest = True
+        figures = True,
+        prep_pest = False,
+        run_pest = False
     )
-    surrogate_workflow()
+    # surrogate_workflow()
