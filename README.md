@@ -124,6 +124,7 @@ transport on its flow-transport link file.
   installed editable
 - [PHT3D-FSP](https://github.com/SLS-github/PHT3D-FSP) — vendored at `dependencies/pht3d_fsp`,
   patched to read a CSV species table instead of `.xlsx`
+- [vorflow](https://github.com/rhugman/vorflow) — Voronoi mesh generation for MODFLOW 6
 
 Executables (`mf6`, `libmf6`, `mf2005`, `mt3dms`, `pht3d`, `pestpp-*`) live in `bin/mac`.
 
